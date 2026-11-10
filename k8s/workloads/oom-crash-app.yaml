@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oom-crash-app
+  namespace: default
+  labels:
+    app: oom-crash-app
+    tier: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oom-crash-app
+  template:
+    metadata:
+      labels:
+        app: oom-crash-app
+    spec:
+      containers:
+        - name: worker
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+            - |
+              import time
+              print("[oom-worker] Worker starting up...", flush=True)
+              print("[oom-worker] Allocating 65MB memory chunk...", flush=True)
+              # Intentionally allocates 65MiB within a 32MiB memory limit cgroup
+              buf = bytearray(65 * 1024 * 1024)
+              print("[oom-worker] Memory allocation succeeded!", flush=True)
+              time.sleep(300)
+          resources:
+            requests:
+              memory: 16Mi
+              cpu: 50m
+            limits:
+              memory: 32Mi
+              cpu: 100m

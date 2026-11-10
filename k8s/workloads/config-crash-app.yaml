@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-crash-app
+  namespace: default
+  labels:
+    app: config-crash-app
+    tier: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: config-crash-app
+  template:
+    metadata:
+      labels:
+        app: config-crash-app
+    spec:
+      containers:
+        - name: api-server
+          image: python:3.12-alpine
+          env:
+            - name: APP_ENV
+              value: "production"
+            - name: REQUIRED_PORT
+              value: "invalid_port"
+          command:
+            - python
+            - -c
+            - |
+              import os, sys, time
+              print("[config-app] Booting API service...", flush=True)
+              port_raw = os.environ.get("REQUIRED_PORT", "")
+              print(f"[config-app] Validating REQUIRED_PORT='{port_raw}'...", flush=True)
+              try:
+                  port = int(port_raw)
+                  if port < 1 or port > 65535:
+                      raise ValueError("Port out of valid 1-65535 range")
+              except Exception as err:
+                  print(f"[config-app] FATAL ERROR: Invalid port configuration '{port_raw}': {err}", file=sys.stderr, flush=True)
+                  sys.exit(1)
+              print(f"[config-app] Service running successfully on port {port}", flush=True)
+              time.sleep(300)
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 50m
+            limits:
+              memory: 64Mi
+              cpu: 100m

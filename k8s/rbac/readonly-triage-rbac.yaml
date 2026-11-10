@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeheal-reader
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeheal-readonly-role
+rules:
+  # Core resources - strictly read-only inspection verbs
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - events
+      - services
+      - namespaces
+      - configmaps
+      - persistentvolumes
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch"]
+  # Apps resources
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+  # Metrics resources (for kubectl top)
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - pods
+      - nodes
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeheal-readonly-binding
+subjects:
+  - kind: ServiceAccount
+    name: kubeheal-reader
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: kubeheal-readonly-role
+  apiGroup: rbac.authorization.k8s.io

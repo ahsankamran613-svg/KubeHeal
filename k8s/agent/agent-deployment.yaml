@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubeheal-agent
+  namespace: default
+  labels:
+    app: kubeheal-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubeheal-agent
+  template:
+    metadata:
+      labels:
+        app: kubeheal-agent
+    spec:
+      serviceAccountName: kubeheal-reader
+      containers:
+        - name: kubeheal
+          image: kubeheal:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: ENABLE_K8S_WATCHER
+              value: "true"
+            - name: WATCHER_POLL_INTERVAL_SECONDS
+              value: "10"
+            - name: ALERT_COOLDOWN_SECONDS
+              value: "180"
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kubeheal-secrets
+                  key: groq-api-key
+                  optional: true
+            - name: DRY_RUN_MODE
+              value: "true"
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubeheal-service
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: kubeheal-agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
