@@ -5,21 +5,21 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from kubeheal.agent.triage_agent import run_triage_pipeline
+from kubeheal.agent.triage_agent import execute_mcp_tool_call, run_triage_pipeline
 from kubeheal.config import settings
 from kubeheal.mcp_server.guardrails import validate_kubectl_command
-from kubeheal.mcp_server.server import mcp, run_readonly_kubectl
+from kubeheal.mcp_server.server import mcp
 from kubeheal.models import AlertPayload, MCPToolExecution, TriageReport
 from kubeheal.watcher.k8s_watcher import KubernetesWatcher
 
-# In-memory incident store
+# In-memory incident and guardrail audit stores
 incident_store: Dict[str, TriageReport] = {}
+guardrail_audit_log: List[MCPToolExecution] = []
 watcher_instance: Optional[KubernetesWatcher] = None
 
 
@@ -32,13 +32,11 @@ async def handle_alert(alert: AlertPayload):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Launch K8s watcher if enabled
     global watcher_instance
     if settings.enable_k8s_watcher:
         watcher_instance = KubernetesWatcher(on_alert_callback=handle_alert)
         asyncio.create_task(watcher_instance.start())
     yield
-    # Shutdown
     if watcher_instance:
         watcher_instance.stop()
 
@@ -73,9 +71,22 @@ async def serve_dashboard():
 
 @app.get("/api/health")
 async def health_check():
-    """System health check and guardrail status."""
+    """System health check, cluster connectivity, MCP tool count, and guardrail status."""
     from kubeheal.mcp_server.server import _get_k8s_clients
     core_v1, _ = _get_k8s_clients()
+
+    mcp_tools_list = []
+    try:
+        tools = await mcp.list_tools()
+        mcp_tools_list = [t.name for t in tools]
+    except Exception:
+        mcp_tools_list = [
+            "get_pod_status",
+            "get_pod_logs",
+            "get_pod_events",
+            "get_deployment_spec",
+            "run_readonly_kubectl",
+        ]
 
     return {
         "status": "healthy",
@@ -85,6 +96,8 @@ async def health_check():
         "groq_model": settings.groq_model,
         "dry_run_mode": settings.dry_run_mode,
         "github_configured": bool(settings.github_token and settings.github_repo),
+        "mcp_tool_count": len(mcp_tools_list),
+        "mcp_tools": mcp_tools_list,
         "guardrails": {
             "mcp_read_only": "enforced",
             "rbac_verbs": ["get", "list", "watch"],
@@ -157,18 +170,16 @@ class GuardrailTestRequest(BaseModel):
 
 @app.post("/api/guardrail-test")
 async def test_guardrail(req: GuardrailTestRequest):
-    """Simulate a mutating or malicious command to verify immediate blocking by the MCP guardrail."""
+    """Execute a command through the MCP guardrail to verify immediate blocking of unsafe operations."""
     is_valid, reason = validate_kubectl_command(req.command)
-    result = run_readonly_kubectl(command=req.command)
+    result, trace = await execute_mcp_tool_call("run_readonly_kubectl", {"command": req.command})
 
-    # Log to incident traces if an active incident exists
-    trace = MCPToolExecution(
-        tool_name="run_readonly_kubectl",
-        arguments={"command": req.command},
-        blocked_by_guardrail=not is_valid,
-        status="blocked" if not is_valid else "success",
-        output_preview=reason if not is_valid else str(result.get("stdout", ""))[:200],
-    )
+    guardrail_audit_log.append(trace)
+
+    # Also append to the most recent active incident so it is visible in the incident's MCP trace table
+    if incident_store:
+        latest_id = list(incident_store.keys())[-1]
+        incident_store[latest_id].mcp_traces.append(trace)
 
     return {
         "command": req.command,

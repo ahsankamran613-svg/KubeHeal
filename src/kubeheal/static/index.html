@@ -6,22 +6,21 @@
   <title>KubeHeal — Guardrailed Kubernetes AIOps Triage</title>
   <style>
     :root {
-      --bg: #090d16;
-      --surface: #111827;
-      --surface-elevated: #1f2937;
-      --border: #2d3748;
-      --border-subtle: #1e293b;
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
-      --text-dim: #64748b;
-      --primary: #38bdf8;
-      --primary-glow: rgba(56, 189, 248, 0.15);
-      --success: #10b981;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-      --shield: #059669;
-      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-      --font-mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+      --canvas: #0a0d12;
+      --panel: #10151e;
+      --panel-raised: #161d2a;
+      --panel-hover: #1c2536;
+      --rule: #222d40;
+      --rule-subtle: #18202f;
+      --ink: #e2e8f0;
+      --ink-secondary: #94a3b8;
+      --ink-muted: #64748b;
+      --cyan: #38bdf8;
+      --jade: #10b981;
+      --amber: #f59e0b;
+      --crimson: #f43f5e;
+      --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
 
     * {
@@ -31,20 +30,21 @@
     }
 
     body {
-      background-color: var(--bg);
-      color: var(--text-main);
+      background-color: var(--canvas);
+      color: var(--ink);
       font-family: var(--font-sans);
       font-size: 14px;
       line-height: 1.5;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
+      -webkit-font-smoothing: antialiased;
     }
 
-    /* Top Navigation / Status Header */
-    header {
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
+    /* Top Telemetry Bar */
+    .topbar {
+      background: var(--panel);
+      border-bottom: 1px solid var(--rule);
       padding: 14px 24px;
       display: flex;
       align-items: center;
@@ -53,85 +53,82 @@
       flex-wrap: wrap;
     }
 
-    .brand {
+    .brand-cluster {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 14px;
     }
 
-    .brand-icon {
-      width: 32px;
-      height: 32px;
-      background: linear-gradient(135deg, #0284c7, #38bdf8);
-      border-radius: 8px;
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 6px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.4);
       display: flex;
       align-items: center;
       justify-content: center;
-      font-weight: 800;
-      font-size: 16px;
-      color: #fff;
-      box-shadow: 0 0 12px var(--primary-glow);
-    }
-
-    .brand-title {
-      font-size: 16px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .brand-subtitle {
-      color: var(--text-dim);
-      font-size: 12px;
       font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 13px;
+      color: var(--jade);
     }
 
-    .system-badges {
+    .brand-name {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--ink);
+      letter-spacing: -0.01em;
+    }
+
+    .brand-tagline {
+      font-size: 12px;
+      color: var(--ink-muted);
+    }
+
+    .telemetry-pills {
       display: flex;
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
     }
 
-    .badge {
+    .pill {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 9999px;
-      font-size: 11px;
+      gap: 7px;
+      padding: 5px 11px;
+      border-radius: 5px;
+      font-size: 12px;
       font-family: var(--font-mono);
-      font-weight: 500;
-      background: var(--surface-elevated);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
+      background: var(--panel-raised);
+      border: 1px solid var(--rule);
+      color: var(--ink-secondary);
     }
 
-    .badge.active-shield {
-      border-color: rgba(16, 185, 129, 0.4);
-      background: rgba(16, 185, 129, 0.1);
+    .pill-jade {
+      border-color: rgba(16, 185, 129, 0.35);
+      background: rgba(16, 185, 129, 0.08);
       color: #34d399;
     }
 
-    .badge.groq-active {
-      border-color: rgba(56, 189, 248, 0.4);
-      background: rgba(56, 189, 248, 0.1);
-      color: #38bdf8;
+    .pill-cyan {
+      border-color: rgba(56, 189, 248, 0.35);
+      background: rgba(56, 189, 248, 0.08);
+      color: var(--cyan);
     }
 
-    .dot {
+    .status-dot {
       width: 6px;
       height: 6px;
       border-radius: 50%;
       background: currentColor;
     }
 
-    /* Action Dock */
-    .action-dock {
-      background: var(--surface);
-      border-bottom: 1px solid var(--border-subtle);
+    /* Command & Simulation Bar */
+    .control-bar {
+      background: var(--panel);
+      border-bottom: 1px solid var(--rule);
       padding: 12px 24px;
       display: flex;
       align-items: center;
@@ -140,7 +137,7 @@
       flex-wrap: wrap;
     }
 
-    .trigger-group {
+    .action-buttons {
       display: flex;
       align-items: center;
       gap: 10px;
@@ -151,456 +148,568 @@
       cursor: pointer;
       font-family: var(--font-sans);
       font-size: 13px;
-      font-weight: 600;
+      font-weight: 500;
       padding: 7px 14px;
-      border-radius: 6px;
-      border: 1px solid transparent;
+      border-radius: 5px;
+      border: 1px solid var(--rule);
+      background: var(--panel-raised);
+      color: var(--ink);
       display: inline-flex;
       align-items: center;
-      gap: 7px;
-      transition: all 0.15s ease;
+      gap: 8px;
+      transition: background 0.12s ease, border-color 0.12s ease;
     }
 
-    .btn-danger {
-      background: rgba(239, 68, 68, 0.15);
-      border-color: rgba(239, 68, 68, 0.4);
-      color: #f87171;
-    }
-    .btn-danger:hover {
-      background: rgba(239, 68, 68, 0.25);
+    button:hover {
+      background: var(--panel-hover);
     }
 
-    .btn-warning {
-      background: rgba(245, 158, 11, 0.15);
-      border-color: rgba(245, 158, 11, 0.4);
-      color: #fbbf24;
-    }
-    .btn-warning:hover {
-      background: rgba(245, 158, 11, 0.25);
+    button:focus-visible {
+      outline: 2px solid var(--cyan);
+      outline-offset: 1px;
     }
 
-    .btn-secondary {
-      background: var(--surface-elevated);
-      border-color: var(--border);
-      color: var(--text-muted);
+    .btn-oom {
+      border-color: rgba(244, 63, 94, 0.45);
+      background: rgba(244, 63, 94, 0.12);
+      color: #fda4af;
     }
-    .btn-secondary:hover {
-      background: #374151;
-      color: var(--text-main);
+    .btn-oom:hover {
+      background: rgba(244, 63, 94, 0.22);
     }
 
-    .guardrail-test-bar {
+    .btn-crash {
+      border-color: rgba(245, 158, 11, 0.45);
+      background: rgba(245, 158, 11, 0.12);
+      color: #fcd34d;
+    }
+    .btn-crash:hover {
+      background: rgba(245, 158, 11, 0.22);
+    }
+
+    .guardrail-probe {
       display: flex;
       align-items: center;
       gap: 8px;
       flex: 1;
-      max-width: 460px;
+      max-width: 540px;
     }
 
-    .guardrail-input {
+    .probe-input {
       flex: 1;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 6px 12px;
-      color: var(--text-main);
+      background: var(--canvas);
+      border: 1px solid var(--rule);
+      border-radius: 5px;
+      padding: 7px 12px;
+      color: var(--ink);
       font-family: var(--font-mono);
       font-size: 12px;
-      outline: none;
-    }
-    .guardrail-input:focus {
-      border-color: var(--primary);
     }
 
-    /* Main Grid Layout */
-    .main-layout {
+    .probe-input:focus {
+      outline: none;
+      border-color: var(--cyan);
+    }
+
+    /* Inline Guardrail Verdict Banner */
+    .verdict-drawer {
+      display: none;
+      padding: 12px 24px;
+      border-bottom: 1px solid var(--rule);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .verdict-drawer.blocked {
+      display: flex;
+      background: rgba(244, 63, 94, 0.1);
+      border-bottom-color: rgba(244, 63, 94, 0.35);
+      color: #fecdd3;
+    }
+
+    .verdict-drawer.allowed {
+      display: flex;
+      background: rgba(16, 185, 129, 0.1);
+      border-bottom-color: rgba(16, 185, 129, 0.35);
+      color: #a7f3d0;
+    }
+
+    .verdict-tag {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 700;
+      margin-right: 10px;
+    }
+
+    .blocked .verdict-tag {
+      background: var(--crimson);
+      color: #fff;
+    }
+
+    .allowed .verdict-tag {
+      background: var(--jade);
+      color: #052e16;
+    }
+
+    /* Workspace Split Layout */
+    .workspace {
       flex: 1;
       display: grid;
-      grid-template-columns: 340px 1fr;
+      grid-template-columns: 350px 1fr;
       min-height: 0;
     }
 
-    /* Sidebar: Incidents Stream */
-    .incident-sidebar {
-      background: var(--surface);
-      border-right: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
-      height: calc(100vh - 120px);
+    @media (max-width: 900px) {
+      .workspace {
+        grid-template-columns: 1fr;
+      }
     }
 
-    .sidebar-header {
+    /* Left Column: Incident Queue */
+    .incident-queue {
+      background: var(--panel);
+      border-right: 1px solid var(--rule);
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 115px);
+    }
+
+    .queue-header {
       padding: 14px 18px;
-      border-bottom: 1px solid var(--border-subtle);
+      border-bottom: 1px solid var(--rule-subtle);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      font-size: 12px;
-      font-family: var(--font-mono);
-      color: var(--text-dim);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink-secondary);
     }
 
-    .incident-list {
+    .queue-count {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 1px 7px;
+      border-radius: 4px;
+      background: var(--panel-raised);
+      border: 1px solid var(--rule);
+    }
+
+    .queue-list {
       flex: 1;
       overflow-y: auto;
       list-style: none;
     }
 
-    .incident-item {
+    .queue-item {
       padding: 14px 18px;
-      border-bottom: 1px solid var(--border-subtle);
+      border-bottom: 1px solid var(--rule-subtle);
       cursor: pointer;
-      transition: background 0.15s ease;
+      transition: background 0.12s ease;
     }
 
-    .incident-item:hover {
-      background: var(--surface-elevated);
+    .queue-item:hover {
+      background: var(--panel-raised);
     }
 
-    .incident-item.selected {
-      background: rgba(56, 189, 248, 0.08);
-      border-left: 3px solid var(--primary);
+    .queue-item.active {
+      background: var(--panel-hover);
+      border-left: 3px solid var(--cyan);
+      padding-left: 15px;
     }
 
-    .incident-item-header {
+    .queue-item-top {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 8px;
       margin-bottom: 6px;
     }
 
-    .incident-pod-name {
+    .pod-identifier {
+      font-family: var(--font-mono);
       font-weight: 600;
-      color: var(--text-main);
-      font-size: 13px;
+      font-size: 12.5px;
+      color: var(--ink);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 200px;
     }
 
-    .incident-reason {
+    .reason-badge {
       font-family: var(--font-mono);
       font-size: 11px;
-      padding: 2px 6px;
+      padding: 2px 7px;
       border-radius: 4px;
       font-weight: 600;
+      flex-shrink: 0;
     }
 
-    .reason-oom {
-      background: rgba(239, 68, 68, 0.2);
-      color: #f87171;
+    .badge-oom {
+      background: rgba(244, 63, 94, 0.16);
+      color: #fb7185;
+      border: 1px solid rgba(244, 63, 94, 0.3);
     }
 
-    .reason-crash {
-      background: rgba(245, 158, 11, 0.2);
+    .badge-crash {
+      background: rgba(245, 158, 11, 0.16);
       color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.3);
     }
 
-    .incident-time {
-      font-size: 11px;
-      color: var(--text-dim);
+    .queue-item-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11.5px;
       font-family: var(--font-mono);
+      color: var(--ink-muted);
     }
 
-    /* Detail Pane */
-    .incident-detail {
-      padding: 24px 32px;
+    /* Right Column: Triage Inspector */
+    .triage-inspector {
+      padding: 28px 36px;
       overflow-y: auto;
-      height: calc(100vh - 120px);
+      height: calc(100vh - 115px);
     }
 
-    .empty-state {
+    .empty-inspector {
+      height: 100%;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      height: 100%;
-      color: var(--text-dim);
       text-align: center;
-      gap: 12px;
+      max-width: 460px;
+      margin: 0 auto;
+      color: var(--ink-secondary);
     }
 
-    .empty-state-icon {
-      font-size: 40px;
+    .empty-inspector h2 {
+      font-size: 17px;
+      font-weight: 600;
+      color: var(--ink);
       margin-bottom: 8px;
     }
 
-    /* Detail Components */
-    .detail-hero {
-      margin-bottom: 24px;
+    .empty-inspector p {
+      font-size: 13.5px;
+      color: var(--ink-muted);
+      margin-bottom: 20px;
+    }
+
+    /* Incident Report Header */
+    .report-header {
       padding-bottom: 20px;
-      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--rule);
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      gap: 20px;
+      gap: 16px;
       flex-wrap: wrap;
     }
 
-    .detail-title {
+    .report-title {
       font-size: 20px;
-      font-weight: 700;
-      margin-bottom: 6px;
-    }
-
-    .detail-meta {
-      display: flex;
-      gap: 12px;
-      font-size: 12px;
+      font-weight: 600;
+      color: var(--ink);
+      margin-bottom: 8px;
       font-family: var(--font-mono);
-      color: var(--text-muted);
     }
 
-    .section-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+    .report-facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      font-size: 12.5px;
+      font-family: var(--font-mono);
+      color: var(--ink-secondary);
+    }
+
+    .report-facts strong {
+      color: var(--ink);
+    }
+
+    /* Cards */
+    .panel-card {
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-radius: 6px;
       padding: 20px;
       margin-bottom: 20px;
     }
 
-    .section-card-title {
+    .panel-heading {
       font-size: 14px;
       font-weight: 600;
+      color: var(--ink);
       margin-bottom: 12px;
       display: flex;
       align-items: center;
-      gap: 8px;
-      color: var(--text-main);
+      justify-content: space-between;
     }
 
-    .analysis-text {
-      color: #cbd5e1;
-      line-height: 1.6;
+    .diagnosis-prose {
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.65;
+      max-width: 78ch;
       white-space: pre-line;
     }
 
-    /* MCP Trace Table */
-    .trace-table {
+    /* Tables */
+    .data-table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 12px;
       font-family: var(--font-mono);
+      font-size: 12px;
     }
 
-    .trace-table th {
+    .data-table th {
       text-align: left;
-      padding: 8px 12px;
-      background: var(--surface-elevated);
-      color: var(--text-dim);
+      padding: 9px 12px;
+      background: var(--panel-raised);
+      color: var(--ink-secondary);
       font-weight: 600;
-      border-bottom: 1px solid var(--border);
+      border-bottom: 1px solid var(--rule);
     }
 
-    .trace-table td {
+    .data-table td {
       padding: 10px 12px;
-      border-bottom: 1px solid var(--border-subtle);
+      border-bottom: 1px solid var(--rule-subtle);
       vertical-align: top;
+      color: var(--ink-secondary);
     }
 
-    .trace-blocked {
-      color: var(--danger);
+    .status-pass {
+      color: var(--jade);
       font-weight: 600;
     }
 
-    .trace-success {
-      color: var(--success);
+    .status-block {
+      color: var(--crimson);
       font-weight: 600;
     }
 
-    /* Diff Container */
-    .diff-block {
-      background: #050811;
-      border: 1px solid var(--border);
-      border-radius: 6px;
+    /* Diff Viewer */
+    .diff-viewer {
+      background: #070a0e;
+      border: 1px solid var(--rule);
+      border-radius: 5px;
       padding: 14px;
       font-family: var(--font-mono);
-      font-size: 12px;
+      font-size: 12.5px;
       overflow-x: auto;
       line-height: 1.6;
     }
 
-    .diff-line-add {
-      color: #4ade80;
-      background: rgba(34, 197, 94, 0.08);
+    .diff-add {
+      color: #34d399;
+      background: rgba(16, 185, 129, 0.1);
       display: block;
+      padding: 0 6px;
     }
 
-    .diff-line-del {
-      color: #f87171;
-      background: rgba(239, 68, 68, 0.08);
+    .diff-del {
+      color: #fb7185;
+      background: rgba(244, 63, 94, 0.1);
       display: block;
+      padding: 0 6px;
     }
 
-    .diff-line-info {
-      color: #38bdf8;
+    .diff-hunk {
+      color: var(--cyan);
       display: block;
+      padding: 0 6px;
     }
 
-    /* Toast Notification */
-    #toast {
+    .guardrail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }
+
+    .guardrail-box {
+      background: var(--panel-raised);
+      border: 1px solid var(--rule);
+      border-radius: 5px;
+      padding: 14px;
+      font-size: 12.5px;
+    }
+
+    .guardrail-box-title {
+      font-weight: 600;
+      color: var(--ink);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* Toast */
+    #statusToast {
       position: fixed;
-      bottom: 24px;
-      right: 24px;
-      background: var(--surface-elevated);
-      border: 1px solid var(--primary);
-      color: var(--text-main);
-      padding: 12px 20px;
-      border-radius: 6px;
+      bottom: 20px;
+      right: 20px;
+      background: var(--panel-raised);
+      border: 1px solid var(--cyan);
+      color: var(--ink);
+      padding: 10px 16px;
+      border-radius: 5px;
       font-family: var(--font-mono);
-      font-size: 13px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      font-size: 12px;
       display: none;
-      z-index: 1000;
+      z-index: 100;
     }
   </style>
 </head>
 <body>
 
-  <!-- Top Navigation & System Health -->
-  <header>
-    <div class="brand">
-      <div class="brand-icon">KH</div>
+  <header class="topbar">
+    <div class="brand-cluster">
+      <div class="brand-mark">KH</div>
       <div>
-        <div class="brand-title">KubeHeal <span class="badge active-shield"><span class="dot"></span>MCP Guardrails Active</span></div>
-        <div class="brand-subtitle">Autonomous Read-Only Kubernetes AIOps & GitOps Remediator</div>
+        <div class="brand-name">KubeHeal Triage Console</div>
+        <div class="brand-tagline">Guardrailed Kubernetes AIOps with Model Context Protocol &amp; GitOps PRs</div>
       </div>
     </div>
-    <div class="system-badges" id="system-badges">
-      <div class="badge"><span class="dot"></span>Connecting...</div>
+    <div class="telemetry-pills" id="telemetryPills">
+      <span class="pill">Loading system telemetry...</span>
     </div>
   </header>
 
-  <!-- Action Dock -->
-  <div class="action-dock">
-    <div class="trigger-group">
-      <button class="btn-danger" onclick="triggerSimulation('oom-crash')">
-        💥 Simulate OOMKilled
+  <section class="control-bar">
+    <div class="action-buttons">
+      <button class="btn-oom" onclick="runScenario('oom-crash')">
+        Trigger OOMKilled Triage
       </button>
-      <button class="btn-warning" onclick="triggerSimulation('config-crash')">
-        ⚠️ Simulate CrashLoopBackOff
+      <button class="btn-crash" onclick="runScenario('config-crash')">
+        Trigger CrashLoopBackOff Triage
       </button>
-      <button class="btn-secondary" onclick="fetchIncidents()">
-        🔄 Refresh
+      <button onclick="loadIncidents()">
+        Refresh Incidents
       </button>
     </div>
 
-    <!-- Guardrail Live Interceptor Test -->
-    <div class="guardrail-test-bar">
-      <input type="text" id="guardrailCmd" class="guardrail-input" value="kubectl delete pod --all -n default" placeholder="Test forbidden or read-only kubectl query...">
-      <button class="btn-secondary" onclick="testGuardrail()">Test Guardrail</button>
+    <div class="guardrail-probe">
+      <input
+        type="text"
+        id="kubectlProbeInput"
+        class="probe-input"
+        value="kubectl delete pod --all -n default"
+        aria-label="Test kubectl command against MCP guardrail"
+      >
+      <button onclick="evaluateGuardrailCommand()">Test Guardrail Block</button>
     </div>
+  </section>
+
+  <!-- Inline Guardrail Verdict Drawer -->
+  <div id="verdictDrawer" class="verdict-drawer">
+    <div id="verdictContent"></div>
+    <button onclick="closeVerdictDrawer()" style="padding:3px 9px; font-size:11px;">Dismiss</button>
   </div>
 
-  <!-- Main Work Area -->
-  <div class="main-layout">
-    <!-- Incident History Sidebar -->
-    <div class="incident-sidebar">
-      <div class="sidebar-header">
-        <span>Incident Stream</span>
-        <span id="incident-count">0</span>
+  <main class="workspace">
+    <aside class="incident-queue">
+      <div class="queue-header">
+        <span>Incident Timeline</span>
+        <span class="queue-count" id="incidentCounter">0</span>
       </div>
-      <ul class="incident-list" id="incidentList">
-        <!-- Rendered via JS -->
-      </ul>
-    </div>
+      <ul class="queue-list" id="incidentQueueList"></ul>
+    </aside>
 
-    <!-- Incident Detail View -->
-    <div class="incident-detail" id="incidentDetail">
-      <div class="empty-state">
-        <div class="empty-state-icon">🛡️</div>
-        <h3>No Incident Selected</h3>
-        <p>Trigger an <strong>OOMKilled</strong> or <strong>CrashLoopBackOff</strong> simulation above,<br>or test the read-only guardrail interceptor.</p>
+    <section class="triage-inspector" id="triageInspector">
+      <div class="empty-inspector">
+        <h2>Ready for incident triage</h2>
+        <p>Select an active crash scenario above to dispatch the Groq triage agent across the read-only MCP tool suite and generate a GitOps YAML remediation patch.</p>
       </div>
-    </div>
-  </div>
+    </section>
+  </main>
 
-  <div id="toast"></div>
+  <div id="statusToast"></div>
 
   <script>
     let incidents = [];
-    let selectedIncidentId = null;
+    let activeIncidentId = null;
 
-    function showToast(msg, isError = false) {
-      const toast = document.getElementById("toast");
-      toast.innerText = msg;
-      toast.style.borderColor = isError ? "var(--danger)" : "var(--primary)";
-      toast.style.display = "block";
-      setTimeout(() => { toast.style.display = "none"; }, 3500);
+    function notify(message, isError = false) {
+      const el = document.getElementById("statusToast");
+      el.textContent = message;
+      el.style.borderColor = isError ? "var(--crimson)" : "var(--cyan)";
+      el.style.display = "block";
+      setTimeout(() => { el.style.display = "none"; }, 3200);
     }
 
-    async function checkHealth() {
+    async function loadHealth() {
       try {
         const res = await fetch("/api/health");
-        const data = await res.json();
-        const container = document.getElementById("system-badges");
+        const h = await res.json();
+        const container = document.getElementById("telemetryPills");
         container.innerHTML = `
-          <div class="badge ${data.cluster_connected ? 'active-shield' : ''}">
-            <span class="dot"></span>${data.cluster_connected ? 'k3d Connected' : 'Mock/Offline Cluster'}
-          </div>
-          <div class="badge groq-active">
-            <span class="dot"></span>Groq: ${data.groq_model}
-          </div>
-          <div class="badge">
-            <span class="dot"></span>${data.dry_run_mode ? 'GitOps: Dry-Run Proposals' : 'GitOps: GitHub PR'}
-          </div>
-          <div class="badge active-shield">
-            <span class="dot"></span>RBAC: get,list,watch
-          </div>
+          <span class="pill pill-jade">
+            <span class="status-dot"></span>MCP Read-Only Active (${h.mcp_tool_count || 5} tools)
+          </span>
+          <span class="pill pill-cyan">
+            <span class="status-dot"></span>Groq: ${escapeHtml(h.groq_model)}
+          </span>
+          <span class="pill ${h.cluster_connected ? 'pill-jade' : ''}">
+            <span class="status-dot"></span>${h.cluster_connected ? 'k3d Cluster Live' : 'Manifest Simulation Mode'}
+          </span>
+          <span class="pill">
+            GitOps: ${h.dry_run_mode ? 'Local PR Bundle' : 'Live GitHub PR'}
+          </span>
         `;
-      } catch (err) {
-        console.error("Health check failed", err);
+      } catch (e) {
+        console.error("Health check error:", e);
       }
     }
 
-    async function fetchIncidents() {
+    async function loadIncidents() {
       try {
         const res = await fetch("/api/incidents");
         incidents = await res.json();
-        renderIncidentList();
-        if (incidents.length > 0 && !selectedIncidentId) {
+        renderQueue();
+        if (incidents.length > 0 && !activeIncidentId) {
           selectIncident(incidents[0].incident_id);
-        } else if (selectedIncidentId) {
-          const match = incidents.find(i => i.incident_id === selectedIncidentId);
-          if (match) renderIncidentDetail(match);
+        } else if (activeIncidentId) {
+          const current = incidents.find(i => i.incident_id === activeIncidentId);
+          if (current) renderInspector(current);
         }
-      } catch (err) {
-        console.error("Failed to fetch incidents", err);
+      } catch (e) {
+        console.error("Failed loading incidents:", e);
       }
     }
 
-    function renderIncidentList() {
-      const list = document.getElementById("incidentList");
-      const countEl = document.getElementById("incident-count");
-      countEl.innerText = incidents.length;
+    function renderQueue() {
+      const listEl = document.getElementById("incidentQueueList");
+      document.getElementById("incidentCounter").textContent = incidents.length;
 
       if (incidents.length === 0) {
-        list.innerHTML = `
-          <li style="padding: 24px 18px; text-align: center; color: var(--text-dim);">
-            No incidents detected yet.<br>Click a simulation above to start.
+        listEl.innerHTML = `
+          <li style="padding: 24px 18px; color: var(--ink-muted); font-size: 13px;">
+            No incidents recorded yet. Trigger a scenario from the command bar to begin.
           </li>
         `;
         return;
       }
 
-      list.innerHTML = incidents.map(inc => {
-        const isOOM = (inc.alert.reason || "").includes("OOM");
-        const reasonClass = isOOM ? "reason-oom" : "reason-crash";
-        const isSelected = inc.incident_id === selectedIncidentId;
-        const shortTime = new Date(inc.created_at).toLocaleTimeString();
+      listEl.innerHTML = incidents.map(item => {
+        const isOOM = (item.alert.reason || "").toLowerCase().includes("oom");
+        const badgeCls = isOOM ? "badge-oom" : "badge-crash";
+        const activeCls = item.incident_id === activeIncidentId ? "active" : "";
+        const timeStr = new Date(item.created_at).toLocaleTimeString();
 
         return `
-          <li class="incident-item ${isSelected ? 'selected' : ''}" onclick="selectIncident('${inc.incident_id}')">
-            <div class="incident-item-header">
-              <span class="incident-pod-name" title="${inc.alert.pod_name}">${inc.alert.pod_name}</span>
-              <span class="incident-reason ${reasonClass}">${inc.alert.reason}</span>
+          <li class="queue-item ${activeCls}" onclick="selectIncident('${item.incident_id}')">
+            <div class="queue-item-top">
+              <span class="pod-identifier" title="${escapeHtml(item.alert.pod_name)}">${escapeHtml(item.alert.pod_name)}</span>
+              <span class="reason-badge ${badgeCls}">${escapeHtml(item.alert.reason)}</span>
             </div>
-            <div style="display:flex; justify-content:space-between;">
-              <span class="incident-time">#${inc.incident_id}</span>
-              <span class="incident-time">${shortTime}</span>
+            <div class="queue-item-meta">
+              <span>Incident #${escapeHtml(item.incident_id)}</span>
+              <span>${timeStr}</span>
             </div>
           </li>
         `;
@@ -608,151 +717,204 @@
     }
 
     function selectIncident(id) {
-      selectedIncidentId = id;
-      renderIncidentList();
-      const inc = incidents.find(i => i.incident_id === id);
-      if (inc) renderIncidentDetail(inc);
+      activeIncidentId = id;
+      renderQueue();
+      const found = incidents.find(i => i.incident_id === id);
+      if (found) renderInspector(found);
     }
 
-    function renderIncidentDetail(inc) {
-      const container = document.getElementById("incidentDetail");
+    function renderInspector(inc) {
+      const container = document.getElementById("triageInspector");
       const alert = inc.alert;
-      const confidencePercent = Math.round((inc.confidence || 0) * 100);
+      const confidencePct = Math.round((inc.confidence || 0) * 100);
 
-      // Format diff with syntax coloring
-      const diffLines = (inc.yaml_diff || "").split("\n").map(line => {
-        if (line.startsWith("+") && !line.startsWith("+++")) {
-          return `<span class="diff-line-add">${escapeHtml(line)}</span>`;
-        } else if (line.startsWith("-") && !line.startsWith("---")) {
-          return `<span class="diff-line-del">${escapeHtml(line)}</span>`;
-        } else if (line.startsWith("@@")) {
-          return `<span class="diff-line-info">${escapeHtml(line)}</span>`;
-        }
-        return `<span>${escapeHtml(line)}</span>`;
-      }).join("\n");
+      const modRows = (inc.proposed_fix || []).map(mod => `
+        <tr>
+          <td style="color:var(--ink); font-weight:600;">${escapeHtml(mod.parameter_path)}</td>
+          <td style="color:#fb7185;">${escapeHtml(mod.old_value ?? 'unset')}</td>
+          <td style="color:#34d399; font-weight:600;">${escapeHtml(mod.new_value)}</td>
+          <td>${escapeHtml(mod.rationale)}</td>
+        </tr>
+      `).join("");
 
-      // Format MCP tool traces
       const traceRows = (inc.mcp_traces || []).map(t => {
-        const badgeClass = t.blocked_by_guardrail ? "trace-blocked" : (t.status === "success" ? "trace-success" : "");
-        const badgeText = t.blocked_by_guardrail ? "🛡️ BLOCKED" : (t.status === "success" ? "✅ SUCCESS" : "⚠️ " + t.status.toUpperCase());
+        const statusCls = t.blocked_by_guardrail ? "status-block" : "status-pass";
+        const statusLabel = t.blocked_by_guardrail ? "BLOCKED BY GUARDRAIL" : "VERIFIED READ-ONLY";
         return `
           <tr>
-            <td style="font-weight:600; color:var(--text-main);">${escapeHtml(t.tool_name)}</td>
-            <td style="color:var(--text-muted);">${escapeHtml(JSON.stringify(t.arguments))}</td>
-            <td class="${badgeClass}">${badgeText}</td>
-            <td style="color:var(--text-dim); max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(t.output_preview)}">
+            <td style="color:var(--ink); font-weight:600;">${escapeHtml(t.tool_name)}</td>
+            <td>${escapeHtml(JSON.stringify(t.arguments))}</td>
+            <td class="${statusCls}">${statusLabel}</td>
+            <td style="max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(t.output_preview)}">
               ${escapeHtml(t.output_preview)}
             </td>
           </tr>
         `;
       }).join("");
 
+      const formattedDiff = (inc.yaml_diff || "").split("\n").map(line => {
+        if (line.startsWith("+") && !line.startsWith("+++")) {
+          return `<span class="diff-add">${escapeHtml(line)}</span>`;
+        }
+        if (line.startsWith("-") && !line.startsWith("---")) {
+          return `<span class="diff-del">${escapeHtml(line)}</span>`;
+        }
+        if (line.startsWith("@@")) {
+          return `<span class="diff-hunk">${escapeHtml(line)}</span>`;
+        }
+        return `<span>${escapeHtml(line)}</span>`;
+      }).join("\n");
+
       container.innerHTML = `
-        <div class="detail-hero">
+        <div class="report-header">
           <div>
-            <div class="detail-title">Incident ${inc.incident_id} — ${escapeHtml(alert.pod_name)}</div>
-            <div class="detail-meta">
-              <span>Reason: <strong>${escapeHtml(alert.reason)}</strong></span>
-              <span>Exit Code: <strong>${alert.exit_code !== null ? alert.exit_code : 'N/A'}</strong></span>
+            <div class="report-title">${escapeHtml(alert.pod_name)}</div>
+            <div class="report-facts">
+              <span>Incident: <strong>#${escapeHtml(inc.incident_id)}</strong></span>
+              <span>Deployment: <strong>${escapeHtml(alert.deployment_name || 'default')}</strong></span>
               <span>Namespace: <strong>${escapeHtml(alert.namespace)}</strong></span>
-              <span>AI Confidence: <strong>${confidencePercent}%</strong></span>
-              <span>Duration: <strong>${inc.duration_seconds || '0.5'}s</strong></span>
+              <span>Reason: <strong>${escapeHtml(alert.reason)} (Exit ${alert.exit_code ?? 'N/A'})</strong></span>
+              <span>Confidence: <strong>${confidencePct}%</strong></span>
+              <span>Triage time: <strong>${inc.duration_seconds ?? 0.1}s</strong></span>
             </div>
           </div>
           <div>
-            ${inc.pr_url ? `<a href="${inc.pr_url}" target="_blank" class="badge" style="background:#238636; color:#fff; text-decoration:none; padding:8px 14px; font-weight:600;">View GitHub PR ↗</a>` : ''}
-            ${inc.local_proposal_path ? `<span class="badge" title="Bundle saved on disk">📁 ${escapeHtml(inc.local_proposal_path)}</span>` : ''}
+            ${inc.pr_url
+              ? `<a href="${escapeHtml(inc.pr_url)}" target="_blank" class="pill pill-jade" style="text-decoration:none;">Open GitHub Pull Request ↗</a>`
+              : `<span class="pill pill-cyan">Proposal bundle: ${escapeHtml(inc.local_proposal_path || 'output/proposals/' + inc.incident_id)}</span>`
+            }
           </div>
         </div>
 
-        <!-- AI Root Cause Card -->
-        <div class="section-card">
-          <div class="section-card-title">🔍 AI Root Cause Diagnosis</div>
-          <div class="analysis-text">${escapeHtml(inc.root_cause_summary)}</div>
+        <div class="panel-card">
+          <div class="panel-heading">
+            <span>Root Cause Diagnosis</span>
+            <span style="font-family:var(--font-mono); font-size:12px; color:var(--ink-muted);">Model: openai/gpt-oss-120b</span>
+          </div>
+          <div class="diagnosis-prose">${escapeHtml(inc.root_cause_summary)}</div>
         </div>
 
-        <!-- MCP Tool Audit Traces Card -->
-        <div class="section-card">
-          <div class="section-card-title">🔬 MCP Read-Only Inspection Traces (${(inc.mcp_traces || []).length} Operations)</div>
-          <table class="trace-table">
+        <div class="panel-card">
+          <div class="panel-heading">
+            <span>MCP Read-Only Tool Execution Trace</span>
+            <span style="font-family:var(--font-mono); font-size:12px; color:var(--jade);">${(inc.mcp_traces || []).length} audited calls</span>
+          </div>
+          <table class="data-table">
             <thead>
               <tr>
-                <th>Tool</th>
+                <th>MCP Tool</th>
                 <th>Arguments</th>
-                <th>Guardrail Status</th>
-                <th>Output Preview</th>
+                <th>Guardrail Verdict</th>
+                <th>Telemetry Preview</th>
               </tr>
             </thead>
             <tbody>
-              ${traceRows || '<tr><td colspan="4" style="color:var(--text-dim);">No MCP traces recorded.</td></tr>'}
+              ${traceRows || '<tr><td colspan="4">No tool calls recorded.</td></tr>'}
             </tbody>
           </table>
         </div>
 
-        <!-- GitOps YAML Remediation Diff Card -->
-        <div class="section-card">
-          <div class="section-card-title">🛠️ GitOps Manifest Remediation Diff (ruamel.yaml)</div>
-          <pre class="diff-block">${diffLines || 'No diff generated.'}</pre>
+        <div class="panel-card">
+          <div class="panel-heading">
+            <span>Proposed GitOps Manifest Patch (ruamel.yaml)</span>
+          </div>
+          ${modRows ? `
+            <table class="data-table" style="margin-bottom: 16px;">
+              <thead>
+                <tr>
+                  <th>Parameter Path</th>
+                  <th>Previous</th>
+                  <th>Proposed</th>
+                  <th>Engineering Rationale</th>
+                </tr>
+              </thead>
+              <tbody>${modRows}</tbody>
+            </table>
+          ` : ''}
+          <pre class="diff-viewer">${formattedDiff || 'No YAML diff generated.'}</pre>
         </div>
 
-        <!-- Defense-in-Depth Verification Card -->
-        <div class="section-card">
-          <div class="section-card-title">🛡️ Defense-in-Depth Guardrail Verification</div>
-          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:12px; font-size:12px;">
-            <div style="background:var(--surface-elevated); padding:12px; border-radius:6px; border:1px solid var(--border);">
-              <strong>1. Code-Level MCP Guardrail</strong><br>
-              <span style="color:#34d399;">✓ Enforced</span>: Mutating verbs (delete, apply, patch, exec) and shell injections blocked.
+        <div class="panel-card">
+          <div class="panel-heading">
+            <span>3-Layer Guardrail Compliance</span>
+          </div>
+          <div class="guardrail-grid">
+            <div class="guardrail-box">
+              <div class="guardrail-box-title">
+                <span>1. Code-Level MCP Guardrail</span>
+                <span class="status-pass">Enforced</span>
+              </div>
+              <p style="color:var(--ink-secondary);">Whitelists only get, describe, logs, events, top. Blocks delete, apply, patch, exec, shell pipes, and jsonpath secret harvesting.</p>
             </div>
-            <div style="background:var(--surface-elevated); padding:12px; border-radius:6px; border:1px solid var(--border);">
-              <strong>2. Cluster-Level RBAC Guardrail</strong><br>
-              <span style="color:#34d399;">✓ Enforced</span>: ServiceAccount <code>kubeheal-reader</code> restricted to <code>["get", "list", "watch"]</code>.
+            <div class="guardrail-box">
+              <div class="guardrail-box-title">
+                <span>2. Cluster-Level RBAC</span>
+                <span class="status-pass">Enforced</span>
+              </div>
+              <p style="color:var(--ink-secondary);">ServiceAccount <code>kubeheal-reader</code> is bound to ClusterRole permitting only <code>["get", "list", "watch"]</code> verbs.</p>
             </div>
-            <div style="background:var(--surface-elevated); padding:12px; border-radius:6px; border:1px solid var(--border);">
-              <strong>3. GitOps Human-in-the-Loop</strong><br>
-              <span style="color:#34d399;">✓ Enforced</span>: Zero live cluster mutation. Remediations proposed as PR or local proposal bundle.
+            <div class="guardrail-box">
+              <div class="guardrail-box-title">
+                <span>3. GitOps Human-in-the-Loop</span>
+                <span class="status-pass">Enforced</span>
+              </div>
+              <p style="color:var(--ink-secondary);">Zero direct cluster mutation. Memory limits are clamped to a 1Gi ceiling and proposed via Pull Request.</p>
             </div>
           </div>
         </div>
       `;
     }
 
-    async function triggerSimulation(scenario) {
-      showToast(`Initiating simulation: ${scenario}...`);
+    async function runScenario(scenario) {
+      notify(`Running ${scenario} triage pipeline...`);
       try {
         const res = await fetch(`/api/simulate/${scenario}`, { method: "POST" });
-        if (!res.ok) throw new Error("Simulation request failed");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const report = await res.json();
-        showToast(`Triage completed for incident ${report.incident_id}!`);
-        await fetchIncidents();
+        notify(`Completed triage for incident #${report.incident_id}`);
+        await loadIncidents();
         selectIncident(report.incident_id);
-      } catch (err) {
-        showToast(err.message, true);
+      } catch (e) {
+        notify(`Simulation failed: ${e.message}`, true);
       }
     }
 
-    async function testGuardrail() {
-      const cmd = document.getElementById("guardrailCmd").value;
-      if (!cmd) return;
+    async function evaluateGuardrailCommand() {
+      const input = document.getElementById("kubectlProbeInput");
+      const command = input.value.trim();
+      if (!command) return;
+
       try {
         const res = await fetch("/api/guardrail-test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: cmd }),
+          body: JSON.stringify({ command }),
         });
         const data = await res.json();
+        const drawer = document.getElementById("verdictDrawer");
+        const content = document.getElementById("verdictContent");
+
         if (data.guardrail_verdict === "BLOCKED") {
-          alert(`🛡️ GUARDRAIL INTERCEPTED VIOLATION!\n\nCommand: ${data.command}\nStatus: BLOCKED\nReason: ${data.reason}`);
+          drawer.className = "verdict-drawer blocked";
+          content.innerHTML = `<span class="verdict-tag">BLOCKED</span> <strong>${escapeHtml(data.command)}</strong> — ${escapeHtml(data.reason)}`;
         } else {
-          alert(`✅ COMMAND ALLOWED BY READ-ONLY GUARDRAIL\n\nCommand: ${data.command}\nResult:\n${data.execution_result.stdout || data.execution_result.stderr || '(no output)'}`);
+          drawer.className = "verdict-drawer allowed";
+          content.innerHTML = `<span class="verdict-tag">ALLOWED</span> <strong>${escapeHtml(data.command)}</strong> — ${escapeHtml(data.reason)}`;
         }
-      } catch (err) {
-        showToast("Guardrail test request failed: " + err.message, true);
+
+        await loadIncidents();
+      } catch (e) {
+        notify(`Guardrail check error: ${e.message}`, true);
       }
     }
 
-    function escapeHtml(str) {
-      if (!str) return "";
-      return String(str)
+    function closeVerdictDrawer() {
+      document.getElementById("verdictDrawer").className = "verdict-drawer";
+    }
+
+    function escapeHtml(val) {
+      if (val === null || val === undefined) return "";
+      return String(val)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
@@ -760,10 +922,9 @@
         .replace(/'/g, "&#039;");
     }
 
-    // Initialize
-    checkHealth();
-    fetchIncidents();
-    setInterval(fetchIncidents, 10000);
+    loadHealth();
+    loadIncidents();
+    setInterval(loadIncidents, 10000);
   </script>
 </body>
 </html>

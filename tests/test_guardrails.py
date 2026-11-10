@@ -1,6 +1,5 @@
 """Unit tests verifying code-level MCP guardrail validation and protection."""
 
-import pytest
 from kubeheal.mcp_server.guardrails import validate_kubectl_command
 
 
@@ -12,7 +11,7 @@ def test_allowed_readonly_commands():
         "kubectl logs -f oom-crash-app-xyz --tail=50",
         "kubectl events -n default",
         "kubectl top pods",
-        "get pods -n default",
+        "get pods -n default -o wide",
         "describe deployment config-crash-app",
         "logs my-pod -p",
     ]
@@ -62,11 +61,15 @@ def test_blocked_shell_injections():
 def test_blocked_sensitive_resources_and_flags():
     sensitive_cases = [
         ("kubectl get secrets", "Access to resource type 'secrets' is prohibited"),
-        ("kubectl describe secret db-credential", "Access to resource type 'secret' is prohibited"),
+        ("kubectl get pods,secrets", "Access to resource type 'secrets' is prohibited"),
+        ("kubectl describe secret/db-credential", "Access to resource type 'secret' is prohibited"),
         ("kubectl get serviceaccounts", "Access to resource type 'serviceaccounts' is prohibited"),
         ("kubectl get pods --token=secret-token-xyz", "Flag '--token' is blocked"),
         ("kubectl get pods --kubeconfig=/root/.kube/config", "Flag '--kubeconfig' is blocked"),
         ("kubectl get pods --as=cluster-admin", "Flag '--as' is blocked"),
+        ("kubectl get pods -o jsonpath='{.items[*]}'", "Output template extraction"),
+        ("kubectl get pods --output=jsonpath={.items[*].spec}", "Output template extraction"),
+        ("kubectl get pods -o=go-template='{{.items}}'", "Output template extraction"),
     ]
     for cmd, expected_err in sensitive_cases:
         is_valid, msg = validate_kubectl_command(cmd)

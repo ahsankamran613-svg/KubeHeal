@@ -6,7 +6,7 @@ secret extraction, and privilege escalation.
 
 import re
 import shlex
-from typing import Tuple, Set
+from typing import Set, Tuple
 
 ALLOWED_KUBECTL_VERBS: Set[str] = {
     "get",
@@ -67,6 +67,12 @@ FORBIDDEN_FLAGS: Set[str] = {
     "--as-group",
     "--as-uid",
 }
+
+# Disallow jsonpath / template expressions that attempt to dump secret data or env credentials
+FORBIDDEN_OUTPUT_TEMPLATES = re.compile(
+    r"(jsonpath|go-template|custom-columns)",
+    re.IGNORECASE,
+)
 
 
 class GuardrailException(Exception):
@@ -134,8 +140,8 @@ def validate_kubectl_command(cmd_str: str) -> Tuple[bool, str]:
             f"Security violation: Verb '{verb}' is not in the allowed read-only whitelist {sorted(ALLOWED_KUBECTL_VERBS)}",
         )
 
-    # 5. Check forbidden flags
-    for token in tokens:
+    # 5. Check forbidden flags & custom template extraction (-o jsonpath, etc.)
+    for i, token in enumerate(tokens):
         token_lower = token.lower()
         for forbidden_flag in FORBIDDEN_FLAGS:
             if token_lower == forbidden_flag or token_lower.startswith(f"{forbidden_flag}="):
@@ -144,14 +150,35 @@ def validate_kubectl_command(cmd_str: str) -> Tuple[bool, str]:
                     f"Security violation: Flag '{forbidden_flag}' is blocked for privilege and credential isolation",
                 )
 
-    # 6. Check forbidden resources (e.g. attempting to read secrets or RBAC credentials)
+        # Check -o jsonpath / --output=jsonpath / -o=jsonpath
+        if token_lower in ("-o", "--output") and i + 1 < len(tokens):
+            next_val = tokens[i + 1]
+            if FORBIDDEN_OUTPUT_TEMPLATES.search(next_val):
+                return (
+                    False,
+                    f"Security violation: Output template extraction ('{token} {next_val}') is blocked to prevent secret harvesting",
+                )
+        elif token_lower.startswith("-o=") or token_lower.startswith("--output=") or (
+            token_lower.startswith("-o") and len(token_lower) > 2
+        ):
+            if FORBIDDEN_OUTPUT_TEMPLATES.search(token_lower):
+                return (
+                    False,
+                    f"Security violation: Output template extraction ('{token}') is blocked to prevent secret harvesting",
+                )
+
+    # 6. Check forbidden resources (including slash-separated 'secrets/foo' and comma-separated 'pods,secrets')
     remaining_tokens = tokens[verb_idx + 1:]
     for token in remaining_tokens:
-        clean_token = token.lower().split("/")[0]  # e.g. secrets/my-secret -> secrets
-        if clean_token in FORBIDDEN_RESOURCES:
-            return (
-                False,
-                f"Security violation: Access to resource type '{clean_token}' is prohibited by credential isolation guardrail",
-            )
+        if token.startswith("-"):
+            continue
+        # Split on both '/' (e.g. secret/db-pass) and ',' (e.g. pods,secrets)
+        sub_resources = re.split(r"[/,]", token.lower())
+        for sub in sub_resources:
+            if sub in FORBIDDEN_RESOURCES:
+                return (
+                    False,
+                    f"Security violation: Access to resource type '{sub}' is prohibited by credential isolation guardrail",
+                )
 
     return True, "Command approved by read-only guardrail"
