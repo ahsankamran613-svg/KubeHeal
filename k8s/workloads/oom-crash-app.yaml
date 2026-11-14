@@ -32,8 +32,8 @@ spec:
               time.sleep(300)
           resources:
             requests:
-              memory: 16Mi
+              memory: 64Mi
               cpu: 50m
             limits:
-              memory: 32Mi
+              memory: 128Mi
               cpu: 100m
