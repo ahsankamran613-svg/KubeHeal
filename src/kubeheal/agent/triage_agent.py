@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -9,7 +10,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from kubeheal.config import settings
 from kubeheal.gitops.github_pr import create_remediation_proposal
-from kubeheal.gitops.yaml_patcher import find_manifest_for_deployment, patch_deployment_yaml
+from kubeheal.gitops.yaml_patcher import (
+    clamp_memory_limit,
+    find_manifest_for_deployment,
+    format_bytes_to_k8s_memory,
+    infer_workload_name_from_pod,
+    parse_memory_to_bytes,
+    patch_deployment_yaml,
+    select_target_container,
+)
 from kubeheal.mcp_server.guardrails import validate_kubectl_command
 from kubeheal.mcp_server.server import (
     get_deployment_spec,
@@ -45,9 +54,13 @@ SUBMIT_SOLUTION_TOOL_SCHEMA: Dict[str, Any] = {
                     "items": {
                         "type": "object",
                         "properties": {
+                            "container_name": {
+                                "type": "string",
+                                "description": "Name of the target container to modify (optional if single container)",
+                            },
                             "parameter_path": {
                                 "type": "string",
-                                "description": "e.g. 'resources.limits.memory' or 'env[REQUIRED_PORT]'",
+                                "description": "Target YAML path, e.g. 'resources.limits.memory', 'resources.requests.memory', 'image', 'command', 'args', or 'env[<VAR_NAME>]'",
                             },
                             "old_value": {"type": "string", "description": "Existing value"},
                             "new_value": {"type": "string", "description": "Recommended new value"},
@@ -145,6 +158,7 @@ def _direct_tool_fallback(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             namespace=args.get("namespace", "default"),
             tail_lines=int(args.get("tail_lines", 100)),
             previous=bool(args.get("previous", True)),
+            container_name=args.get("container_name"),
         )
     if name == "get_pod_events":
         return get_pod_events(pod_name=args.get("pod_name", ""), namespace=args.get("namespace", "default"))
@@ -158,112 +172,200 @@ def _direct_tool_fallback(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     return {"error": f"Unknown tool: {name}"}
 
 
+def _compute_scaled_oom_memory(current_limit_str: Optional[str], current_req_str: Optional[str]) -> Tuple[str, str, str, str]:
+    """Dynamically calculate scaled memory limit and request based on the container's actual current resources."""
+    old_limit = current_limit_str or "32Mi"
+    old_req = current_req_str or "16Mi"
+
+    try:
+        limit_bytes = parse_memory_to_bytes(old_limit)
+    except Exception:
+        limit_bytes = 32 * 1024 * 1024
+
+    # Scale 4x for small limits (<128Mi), 2x for larger limits
+    if limit_bytes < 128 * 1024 * 1024:
+        proposed_limit_bytes = limit_bytes * 4
+    else:
+        proposed_limit_bytes = limit_bytes * 2
+
+    raw_new_limit = format_bytes_to_k8s_memory(proposed_limit_bytes)
+    new_limit, _ = clamp_memory_limit(raw_new_limit, current_limit_str=old_limit)
+
+    try:
+        final_limit_bytes = parse_memory_to_bytes(new_limit)
+        new_req_bytes = max(16 * 1024 * 1024, final_limit_bytes // 2)
+        new_req = format_bytes_to_k8s_memory(new_req_bytes)
+    except Exception:
+        new_req = "64Mi"
+
+    return old_limit, new_limit, old_req, new_req
+
+
 async def _deterministic_fallback_triage(
     alert: AlertPayload,
     manifest_path: Optional[Path],
 ) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution]]:
-    """Intelligent deterministic diagnostic engine used when GROQ_API_KEY is not configured."""
+    """Intelligent deterministic diagnostic engine that inspects actual MCP tool outputs and container specs."""
     traces: List[MCPToolExecution] = []
 
-    _, trace_status = await execute_mcp_tool_call(
+    status_res, trace_status = await execute_mcp_tool_call(
         "get_pod_status",
         {"pod_name": alert.pod_name, "namespace": alert.namespace},
     )
     traces.append(trace_status)
 
-    _, trace_events = await execute_mcp_tool_call(
+    events_res, trace_events = await execute_mcp_tool_call(
         "get_pod_events",
         {"pod_name": alert.pod_name, "namespace": alert.namespace},
     )
     traces.append(trace_events)
 
-    _, trace_logs = await execute_mcp_tool_call(
-        "get_pod_logs",
-        {"pod_name": alert.pod_name, "namespace": alert.namespace, "previous": True},
-    )
+    log_args: Dict[str, Any] = {"pod_name": alert.pod_name, "namespace": alert.namespace, "previous": True}
+    if alert.container_name:
+        log_args["container_name"] = alert.container_name
+    logs_res, trace_logs = await execute_mcp_tool_call("get_pod_logs", log_args)
     traces.append(trace_logs)
 
-    dep_name = alert.deployment_name or alert.pod_name.rsplit("-", 2)[0]
-    _, trace_spec = await execute_mcp_tool_call(
+    dep_name = alert.deployment_name or infer_workload_name_from_pod(alert.pod_name)
+    spec_res, trace_spec = await execute_mcp_tool_call(
         "get_deployment_spec",
         {"deployment_name": dep_name, "namespace": alert.namespace},
     )
     traces.append(trace_spec)
 
+    # Extract actual container spec from MCP get_deployment_spec response
+    spec_containers = spec_res.get("containers", []) if isinstance(spec_res, dict) else []
+    target_c_spec: Dict[str, Any] = {}
+    if spec_containers:
+        try:
+            target_c_spec = select_target_container(spec_containers, alert.container_name)
+        except Exception:
+            target_c_spec = spec_containers[0]
+
+    target_container_name = alert.container_name or target_c_spec.get("name")
+    target_file = str(manifest_path) if manifest_path else f"{settings.manifests_dir}/{dep_name}.yaml"
+
+    c_resources = target_c_spec.get("resources") or {}
+    curr_limit_mem = (c_resources.get("limits") or {}).get("memory")
+    curr_req_mem = (c_resources.get("requests") or {}).get("memory")
+    env_list = target_c_spec.get("env") or []
+    env_map = {e.get("name"): e.get("value") for e in env_list if isinstance(e, dict) and e.get("name")}
+
+    logs_text = str((logs_res or {}).get("logs", ""))
     reason_lower = alert.reason.lower()
     msg_lower = (alert.message or "").lower()
+    combined_text = f"{reason_lower} {msg_lower} {logs_text.lower()}"
 
     modifications: List[YAMLModification] = []
 
-    if "oom" in reason_lower or alert.exit_code == 137 or "oomkilled" in msg_lower:
+    # Case 1: OOMKilled / exit code 137
+    if "oom" in reason_lower or alert.exit_code == 137 or "oomkilled" in combined_text:
+        old_limit, new_limit, old_req, new_req = _compute_scaled_oom_memory(curr_limit_mem, curr_req_mem)
         root_cause = (
-            f"Pod '{alert.pod_name}' was terminated by the Linux kernel OOM (Out Of Memory) killer with exit code 137. "
-            "Container inspection via MCP shows the Python worker allocates a ~65MB buffer inside a 32Mi memory cgroup limit. "
-            "Remediation increases memory limits to 128Mi and requests to 64Mi."
+            f"Pod '{alert.pod_name}' (container '{target_container_name or 'primary'}') was terminated by the Linux kernel "
+            f"OOM (Out Of Memory) killer with exit code 137. Container inspection via MCP shows memory limit was set to "
+            f"'{old_limit}'. Remediation scales memory limits to '{new_limit}' and requests to '{new_req}'."
         )
         modifications.append(
             YAMLModification(
-                file_path=str(manifest_path) if manifest_path else "k8s/workloads/oom-crash-app.yaml",
+                file_path=target_file,
+                container_name=target_container_name,
                 parameter_path="resources.limits.memory",
-                old_value="32Mi",
-                new_value="128Mi",
-                rationale="Increase memory limit from 32Mi to 128Mi to accommodate the 65MB workload buffer with headroom.",
+                old_value=old_limit,
+                new_value=new_limit,
+                rationale=f"Increase memory limit from {old_limit} to {new_limit} to prevent OOMKilled terminations.",
             )
         )
         modifications.append(
             YAMLModification(
-                file_path=str(manifest_path) if manifest_path else "k8s/workloads/oom-crash-app.yaml",
+                file_path=target_file,
+                container_name=target_container_name,
                 parameter_path="resources.requests.memory",
-                old_value="16Mi",
-                new_value="64Mi",
-                rationale="Align memory request with actual baseline container memory footprint.",
+                old_value=old_req,
+                new_value=new_req,
+                rationale=f"Align memory request ({new_req}) with updated container memory ceiling.",
             )
         )
-        confidence = 0.98
+        return root_cause, 0.98, modifications, traces
 
-    elif "port" in msg_lower or "config" in alert.pod_name or "crashloopbackoff" in reason_lower or alert.exit_code == 1:
+    # Case 2: Inspect actual env vars and logs for invalid port / environment configuration errors
+    invalid_port_keys = [
+        k for k, v in env_map.items()
+        if "PORT" in str(k).upper() and v is not None and not str(v).isdigit()
+    ]
+    if not invalid_port_keys and ("invalid_port" in combined_text or "required_port" in combined_text):
+        invalid_port_keys = ["REQUIRED_PORT"]
+
+    if invalid_port_keys:
+        port_key = invalid_port_keys[0]
+        old_port_val = env_map.get(port_key, "invalid_port")
         root_cause = (
-            f"Pod '{alert.pod_name}' entered CrashLoopBackOff (exit code 1) due to invalid environment configuration. "
-            "Container logs retrieved via MCP reveal: \"FATAL ERROR: Invalid port configuration 'invalid_port'\". "
-            "In addition, MEMORY_LIMIT is set to '16Mi' in env. Remediation sets REQUIRED_PORT to '8080' and MEMORY_LIMIT to '128Mi'."
+            f"Pod '{alert.pod_name}' entered {alert.reason} (exit code {alert.exit_code}) due to invalid environment "
+            f"configuration `{port_key}='{old_port_val}'`. Remediation sets `{port_key}` to valid TCP port `'8080'`."
         )
         modifications.append(
             YAMLModification(
-                file_path=str(manifest_path) if manifest_path else "k8s/workloads/config-crash-app.yaml",
-                parameter_path="env[REQUIRED_PORT]",
-                old_value="invalid_port",
+                file_path=target_file,
+                container_name=target_container_name,
+                parameter_path=f"env[{port_key}]",
+                old_value=old_port_val,
                 new_value="8080",
-                rationale="Replace non-numeric port string 'invalid_port' with valid TCP port '8080'.",
+                rationale=f"Replace invalid non-numeric port value '{old_port_val}' in {port_key} with valid TCP port '8080'.",
             )
         )
-        modifications.append(
-            YAMLModification(
-                file_path=str(manifest_path) if manifest_path else "k8s/workloads/config-crash-app.yaml",
-                parameter_path="env[MEMORY_LIMIT]",
-                old_value="16Mi",
-                new_value="128Mi",
-                rationale="Increase application MEMORY_LIMIT environment threshold from 16Mi to 128Mi.",
+        if "MEMORY_LIMIT" in env_map:
+            old_env_mem = env_map["MEMORY_LIMIT"]
+            _, new_env_mem, _, _ = _compute_scaled_oom_memory(old_env_mem, None)
+            modifications.append(
+                YAMLModification(
+                    file_path=target_file,
+                    container_name=target_container_name,
+                    parameter_path="env[MEMORY_LIMIT]",
+                    old_value=old_env_mem,
+                    new_value=new_env_mem,
+                    rationale=f"Increase application MEMORY_LIMIT environment threshold from {old_env_mem} to {new_env_mem}.",
+                )
             )
-        )
-        confidence = 0.96
+        return root_cause, 0.96, modifications, traces
 
-    else:
+    # Case 3: ImagePullBackOff / ErrImagePull / InvalidImageName
+    if reason_lower in ("imagepullbackoff", "errimagepull", "invalidimagename") or "image" in reason_lower:
+        curr_img = target_c_spec.get("image", "unknown")
+        fixed_img = curr_img.split(":")[0] + ":latest" if ":" in curr_img else f"{curr_img}:latest"
         root_cause = (
-            f"Container in pod '{alert.pod_name}' encountered failure '{alert.reason}' (exit code {alert.exit_code}). "
-            f"Message: {alert.message or 'No additional diagnostic details'}. Remediation ensures safe default limits."
+            f"Container '{target_container_name or 'primary'}' in pod '{alert.pod_name}' failed to pull image '{curr_img}' "
+            f"({alert.reason}). Message: {alert.message or 'Image tag not found or inaccessible'}."
         )
         modifications.append(
             YAMLModification(
-                file_path=str(manifest_path) if manifest_path else "k8s/workloads/oom-crash-app.yaml",
-                parameter_path="resources.limits.memory",
-                old_value="unknown",
-                new_value="128Mi",
-                rationale="Ensure container has sufficient baseline memory ceiling.",
+                file_path=target_file,
+                container_name=target_container_name,
+                parameter_path="image",
+                old_value=curr_img,
+                new_value=fixed_img,
+                rationale=f"Update unresolvable container image '{curr_img}' to valid tag '{fixed_img}'.",
             )
         )
-        confidence = 0.85
+        return root_cause, 0.88, modifications, traces
 
-    return root_cause, confidence, modifications, traces
+    # Case 4: Generic application crash / non-zero exit code
+    old_limit, new_limit, _, _ = _compute_scaled_oom_memory(curr_limit_mem, curr_req_mem)
+    log_excerpt = logs_text.strip().splitlines()[-1] if logs_text.strip() else (alert.message or "No log output captured")
+    root_cause = (
+        f"Container '{target_container_name or 'primary'}' in pod '{alert.pod_name}' terminated with '{alert.reason}' "
+        f"(exit code {alert.exit_code}). Diagnostic output: {log_excerpt}."
+    )
+    modifications.append(
+        YAMLModification(
+            file_path=target_file,
+            container_name=target_container_name,
+            parameter_path="resources.limits.memory",
+            old_value=curr_limit_mem or "unset",
+            new_value=new_limit,
+            rationale=f"Ensure container '{target_container_name or 'primary'}' has a safe memory ceiling ({new_limit}).",
+        )
+    )
+    return root_cause, 0.85, modifications, traces
 
 
 async def _run_groq_triage_loop(
@@ -277,20 +379,21 @@ async def _run_groq_triage_loop(
     traces: List[MCPToolExecution] = []
     tools_schema = await discover_mcp_tools_for_groq()
 
-    dep_name = alert.deployment_name or alert.pod_name.rsplit("-", 2)[0]
+    dep_name = alert.deployment_name or infer_workload_name_from_pod(alert.pod_name)
     manifest_name = manifest_path.name if manifest_path else f"{dep_name}.yaml"
+    target_file = str(manifest_path) if manifest_path else f"{settings.manifests_dir}/{manifest_name}"
 
     system_prompt = f"""You are KubeHeal, an autonomous Kubernetes AIOps Triage Agent.
 You are connected to a strictly read-only Model Context Protocol (MCP) server.
 Mutating operations (delete, apply, patch, exec) are strictly blocked by 3-layer guardrails.
 
 INSTRUCTIONS:
-1. Inspect the failing pod '{alert.pod_name}' in namespace '{alert.namespace}' using `get_pod_status`, `get_pod_logs`, `get_pod_events`, and `get_deployment_spec` (for deployment '{dep_name}').
-2. Diagnose the exact root cause of why the container failed (reason: {alert.reason}, exit_code: {alert.exit_code}).
+1. Inspect the failing pod '{alert.pod_name}' (container: '{alert.container_name or "auto-detect"}') in namespace '{alert.namespace}' using `get_pod_status`, `get_pod_logs`, `get_pod_events`, and `get_deployment_spec` (for workload '{dep_name}').
+2. Diagnose the exact root cause of why the container failed (reason: {alert.reason}, exit_code: {alert.exit_code}) based solely on the actual logs, events, and workload specification returned by the MCP tools.
 3. Once you have gathered evidence from the MCP tools, call `submit_triage_solution` with:
    - root_cause_summary: detailed technical diagnosis citing log/event evidence
    - confidence: float between 0.0 and 1.0
-   - modifications: list of YAML changes targeting '{manifest_name}' (use parameter_path like 'resources.limits.memory', 'resources.requests.memory', or 'env[REQUIRED_PORT]'). Keep memory limits <= 1Gi.
+   - modifications: list of YAML changes targeting '{manifest_name}' (supported parameter_path formats: 'resources.limits.memory', 'resources.requests.memory', 'resources.limits.cpu', 'resources.requests.cpu', 'image', 'command', 'args', or 'env[<ENV_VAR_NAME>]'). Keep memory limits within safe bounds (<= {settings.max_memory_limit}).
 """
 
     messages: List[Dict[str, Any]] = [
@@ -298,9 +401,10 @@ INSTRUCTIONS:
         {
             "role": "user",
             "content": (
-                f"Incident alert: Pod '{alert.pod_name}' in namespace '{alert.namespace}' (Deployment: '{dep_name}') "
-                f"is failing with reason '{alert.reason}' (exit_code={alert.exit_code}). "
-                f"Diagnostic message: {alert.message or 'N/A'}. Investigate via MCP tools and submit a remediation patch."
+                f"Incident alert: Pod '{alert.pod_name}' in namespace '{alert.namespace}' (Workload: '{dep_name}', "
+                f"Container: '{alert.container_name or 'primary'}') is failing with reason '{alert.reason}' "
+                f"(exit_code={alert.exit_code}). Diagnostic message: {alert.message or 'N/A'}. "
+                "Investigate via MCP tools and submit a remediation patch."
             ),
         },
     ]
@@ -348,7 +452,8 @@ INSTRUCTIONS:
             for rm in raw_mods:
                 modifications.append(
                     YAMLModification(
-                        file_path=str(manifest_path) if manifest_path else f"k8s/workloads/{manifest_name}",
+                        file_path=target_file,
+                        container_name=rm.get("container_name") or alert.container_name,
                         parameter_path=rm.get("parameter_path", ""),
                         old_value=rm.get("old_value"),
                         new_value=rm.get("new_value"),
@@ -367,8 +472,7 @@ async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
 
     dep_name = alert.deployment_name
     if not dep_name:
-        parts = alert.pod_name.rsplit("-", 2)
-        dep_name = parts[0] if len(parts) >= 3 else alert.pod_name
+        dep_name = infer_workload_name_from_pod(alert.pod_name)
         alert.deployment_name = dep_name
 
     manifest_path = find_manifest_for_deployment(settings.manifests_dir, dep_name)
@@ -391,6 +495,7 @@ async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
             patched_yaml, diff_content, audit_notes = patch_deployment_yaml(
                 file_path=str(manifest_path),
                 modifications=modifications,
+                target_workload_name=dep_name,
             )
             if audit_notes:
                 root_cause += "\n\n**Remediation Guardrail Notes**:\n" + "\n".join(f"- {n}" for n in audit_notes)
@@ -409,7 +514,7 @@ async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
             logger.error(f"Failed to generate YAML patch or PR proposal: {e}")
             diff_content = f"Error generating patch: {str(e)}"
     else:
-        diff_content = f"Target manifest file not found in '{settings.manifests_dir}' for deployment '{dep_name}'."
+        diff_content = f"Target manifest file not found in '{settings.manifests_dir}' for workload '{dep_name}'."
 
     duration = round(time.time() - start_time, 2)
 

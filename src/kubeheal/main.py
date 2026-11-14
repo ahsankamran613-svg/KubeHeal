@@ -101,7 +101,7 @@ async def health_check():
         "guardrails": {
             "mcp_read_only": "enforced",
             "rbac_verbs": ["get", "list", "watch"],
-            "max_memory_cap": "1Gi",
+            "max_memory_cap": settings.max_memory_limit,
         },
     }
 

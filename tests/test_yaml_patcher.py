@@ -4,10 +4,13 @@ import pytest
 from pathlib import Path
 from kubeheal.gitops.yaml_patcher import (
     clamp_memory_limit,
+    find_manifest_for_deployment,
     format_bytes_to_k8s_memory,
+    infer_workload_name_from_pod,
     parse_memory_to_bytes,
     patch_deployment_yaml,
 )
+from kubeheal.gitops.github_pr import resolve_repo_relative_path
 from kubeheal.models import YAMLModification
 
 
@@ -122,3 +125,92 @@ spec:
 
     assert 'value: "8080"' in patched_content or "value: 8080" in patched_content
     assert "-              value: \"invalid_port\"" in diff or "-            value: \"invalid_port\"" in diff
+
+
+def test_infer_workload_name_across_controllers():
+    # Deployment pod
+    assert infer_workload_name_from_pod("payment-service-7598c9f566-x9z2k") == "payment-service"
+    # StatefulSet pod (single hyphen ordinal)
+    assert infer_workload_name_from_pod("redis-cluster-0") == "redis-cluster"
+    assert infer_workload_name_from_pod("postgres-12") == "postgres"
+    # DaemonSet / Job pod (single 5-char hash)
+    assert infer_workload_name_from_pod("node-exporter-k8x9q") == "node-exporter"
+    # Explicit OwnerReferences override
+    assert infer_workload_name_from_pod(
+        "custom-pod-xyz",
+        owner_references=[{"kind": "StatefulSet", "name": "my-stateful-db"}],
+    ) == "my-stateful-db"
+    assert infer_workload_name_from_pod(
+        "web-abc-123",
+        owner_references=[{"kind": "ReplicaSet", "name": "web-app-684cbf9b4d"}],
+    ) == "web-app"
+
+
+def test_recursive_and_multi_kind_manifest_discovery(tmp_path: Path):
+    nested_dir = tmp_path / "prod" / "databases"
+    nested_dir.mkdir(parents=True)
+    sts_file = nested_dir / "redis.yaml"
+    sts_file.write_text(
+        """apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-cluster
+spec:
+  serviceName: redis-headless
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: istio-proxy
+          image: istio/proxyv2:1.20
+        - name: redis
+          image: redis:7.2-alpine
+          resources:
+            limits:
+              memory: 256Mi
+""",
+        encoding="utf-8",
+    )
+
+    # Should find StatefulSet inside nested folder and multi-document YAML
+    found = find_manifest_for_deployment(str(tmp_path), "redis-cluster")
+    assert found is not None
+    assert found == sts_file
+
+    # Patch without specifying container_name -> should skip 'istio-proxy' sidecar and patch 'redis'
+    mods = [
+        YAMLModification(
+            file_path=str(found),
+            parameter_path="resources.limits.memory",
+            old_value="256Mi",
+            new_value="512Mi",
+            rationale="Scale Redis memory limit",
+        )
+    ]
+    patched, diff, notes = patch_deployment_yaml(str(found), mods, target_workload_name="redis-cluster")
+    assert "kind: Service" in patched
+    assert "memory: 512Mi" in patched
+    assert "+              memory: 512Mi" in diff or "+            memory: 512Mi" in diff
+
+
+def test_large_memory_workload_not_shrunk():
+    # If an existing database container already has 2Gi memory limit, proposing 4Gi should NOT shrink it to 1Gi
+    clamped, note = clamp_memory_limit("4Gi", current_limit_str="2Gi")
+    assert clamped == "4Gi"
+    assert note is None
+
+
+def test_resolve_repo_relative_path(tmp_path: Path):
+    repo_root = tmp_path / "my-repo"
+    manifest_file = repo_root / "deployments" / "production" / "api.yaml"
+    manifest_file.parent.mkdir(parents=True)
+    manifest_file.write_text("kind: Deployment", encoding="utf-8")
+
+    rel_path = resolve_repo_relative_path(manifest_file, repo_root=str(repo_root))
+    assert rel_path == "deployments/production/api.yaml"
+

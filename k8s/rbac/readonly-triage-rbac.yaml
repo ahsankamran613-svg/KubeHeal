@@ -29,6 +29,12 @@ rules:
       - statefulsets
       - daemonsets
     verbs: ["get", "list", "watch"]
+  # Batch resources
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
   # Metrics resources (for kubectl top)
   - apiGroups: ["metrics.k8s.io"]
     resources:

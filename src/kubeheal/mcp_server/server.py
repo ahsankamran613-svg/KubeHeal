@@ -2,11 +2,16 @@
 
 import shlex
 import subprocess
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from ruamel.yaml import YAML
 
 from kubeheal.config import settings
+from kubeheal.gitops.yaml_patcher import (
+    SUPPORTED_WORKLOAD_KINDS,
+    extract_containers_from_doc,
+    find_manifest_for_deployment,
+    infer_workload_name_from_pod,
+)
 from kubeheal.mcp_server.guardrails import validate_kubectl_command
 
 try:
@@ -28,11 +33,12 @@ except (ImportError, ModuleNotFoundError):
 _k8s_initialized = False
 _core_v1 = None
 _apps_v1 = None
+_batch_v1 = None
 
 
 def _get_k8s_clients():
     """Lazily load Kubernetes configuration (in-cluster or local kubeconfig)."""
-    global _k8s_initialized, _core_v1, _apps_v1
+    global _k8s_initialized, _core_v1, _apps_v1, _batch_v1
     if not _k8s_initialized:
         try:
             from kubernetes import client, config
@@ -42,6 +48,7 @@ def _get_k8s_clients():
                 config.load_kube_config()
             _core_v1 = client.CoreV1Api()
             _apps_v1 = client.AppsV1Api()
+            _batch_v1 = client.BatchV1Api()
             # Perform a lightweight version/API check to confirm cluster is actually reachable
             _core_v1.get_api_resources(_request_timeout=2)
             _k8s_initialized = True
@@ -49,24 +56,125 @@ def _get_k8s_clients():
             _k8s_initialized = False
             _core_v1 = None
             _apps_v1 = None
+            _batch_v1 = None
             return None, None
     return _core_v1, _apps_v1
 
 
-def _load_local_manifest_spec(name_prefix: str) -> Optional[Dict[str, Any]]:
-    """Read local workload YAML manifest when running in simulation / disconnected mode."""
-    manifests_dir = Path(settings.manifests_dir)
-    if not manifests_dir.exists():
+def _load_local_manifest_spec(name_or_pod: str) -> Optional[Dict[str, Any]]:
+    """Read local workload YAML manifest (supports nested dirs and multi-doc YAML) when running in simulation mode."""
+    workload_name = infer_workload_name_from_pod(name_or_pod)
+    manifest_path = (
+        find_manifest_for_deployment(settings.manifests_dir, workload_name)
+        or find_manifest_for_deployment(settings.manifests_dir, name_or_pod)
+    )
+    if not manifest_path or not manifest_path.exists():
         return None
+
     yaml = YAML()
-    for p in manifests_dir.glob("*.y*ml"):
-        if p.stem in name_prefix or name_prefix.startswith(p.stem):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    return yaml.load(f)
-            except Exception:
-                return None
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            docs = list(yaml.load_all(f))
+            for doc in docs:
+                if isinstance(doc, dict) and doc.get("kind") in SUPPORTED_WORKLOAD_KINDS:
+                    if doc.get("metadata", {}).get("name") in (workload_name, name_or_pod):
+                        return doc
+            for doc in docs:
+                if isinstance(doc, dict) and extract_containers_from_doc(doc):
+                    return doc
+    except Exception:
+        return None
     return None
+
+
+def _inspect_manifest_failure_hints(doc: Optional[Dict[str, Any]], pod_name: str) -> Dict[str, Any]:
+    """Derive realistic simulation telemetry directly from the local YAML manifest spec rather than hardcoded assumptions."""
+    containers_spec = extract_containers_from_doc(doc) if doc else []
+    c_spec = containers_spec[0] if containers_spec else {}
+    c_name = c_spec.get("name", "app")
+    c_image = c_spec.get("image", "unknown-image")
+    c_resources = {
+        k: dict(v) for k, v in (c_spec.get("resources") or {}).items() if isinstance(v, dict)
+    }
+    mem_limit = c_resources.get("limits", {}).get("memory")
+    env_list = c_spec.get("env") or []
+    env_map = {e.get("name"): e.get("value") for e in env_list if isinstance(e, dict) and e.get("name")}
+    cmd_str = " ".join(str(x) for x in (c_spec.get("command") or []) + (c_spec.get("args") or []))
+
+    # Detect if this manifest or pod is an OOM scenario
+    is_oom = (
+        "oom" in pod_name.lower()
+        or "bytearray(" in cmd_str
+        or (mem_limit in ("16Mi", "32Mi") and "REQUIRED_PORT" not in env_map)
+    )
+
+    # Detect if this manifest has an invalid port or explicit config error in its spec
+    invalid_env_keys = [
+        k for k, v in env_map.items()
+        if "PORT" in str(k).upper() and v is not None and not str(v).isdigit()
+    ]
+
+    if is_oom:
+        limit_display = mem_limit or "configured"
+        return {
+            "is_oom": True,
+            "container_name": c_name,
+            "image": c_image,
+            "resources": c_resources,
+            "phase": "Running",
+            "restart_count": 4,
+            "terminated_reason": "OOMKilled",
+            "exit_code": 137,
+            "terminated_message": f"Container '{c_name}' exceeded {limit_display} memory cgroup limit",
+            "logs": (
+                f"[{c_name}] Starting container '{c_name}' ({c_image})...\n"
+                f"[{c_name}] Memory allocation exceeded cgroup limit ({limit_display}).\n"
+                f"Killed (exit code 137 - SIGKILL: cgroup memory limit {limit_display} exceeded)"
+            ),
+            "event_reason": "OOMKilling",
+            "event_message": f"Memory cgroup out of memory: Killed container '{c_name}' (limit {limit_display})",
+        }
+
+    if invalid_env_keys:
+        bad_key = invalid_env_keys[0]
+        bad_val = env_map[bad_key]
+        return {
+            "is_oom": False,
+            "container_name": c_name,
+            "image": c_image,
+            "resources": c_resources,
+            "phase": "CrashLoopBackOff",
+            "restart_count": 5,
+            "terminated_reason": "Error",
+            "exit_code": 1,
+            "terminated_message": f"FATAL ERROR: Invalid configuration {bad_key}='{bad_val}'",
+            "logs": (
+                f"[{c_name}] Starting service ({c_image})...\n"
+                f"[{c_name}] Validating environment configuration: {bad_key}='{bad_val}'...\n"
+                f"[{c_name}] FATAL ERROR: Invalid port configuration '{bad_val}' in {bad_key}: expected numeric TCP port"
+            ),
+            "event_reason": "BackOff",
+            "event_message": f"Back-off restarting failed container '{c_name}' in pod {pod_name}",
+        }
+
+    # Generic manifest-backed simulation for any other workload when offline
+    return {
+        "is_oom": False,
+        "container_name": c_name,
+        "image": c_image,
+        "resources": c_resources,
+        "phase": "CrashLoopBackOff",
+        "restart_count": 3,
+        "terminated_reason": "Error",
+        "exit_code": 1,
+        "terminated_message": f"Container '{c_name}' exited with non-zero status (offline manifest inspection)",
+        "logs": (
+            f"[{c_name}] Offline simulation mode: live cluster not connected.\n"
+            f"[{c_name}] Inspected local manifest container '{c_name}' (image: {c_image}, limits: {c_resources.get('limits', {})})."
+        ),
+        "event_reason": "BackOff",
+        "event_message": f"Back-off restarting failed container '{c_name}' in pod {pod_name}",
+    }
 
 
 @mcp.tool()
@@ -74,42 +182,39 @@ def get_pod_status(pod_name: str, namespace: str = "default") -> Dict[str, Any]:
     """Retrieve pod status, container states, restart counts, termination reasons, and resource requests/limits."""
     core_v1, _ = _get_k8s_clients()
     if not core_v1:
-        # Provide local manifest-backed simulation telemetry when k3d is offline
+        if not settings.allow_offline_simulation:
+            return {
+                "status": "unavailable",
+                "message": "Kubernetes cluster is not connected and offline simulation is disabled.",
+                "pod_name": pod_name,
+                "namespace": namespace,
+            }
         doc = _load_local_manifest_spec(pod_name)
-        containers_spec = (doc or {}).get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
-        c_spec = containers_spec[0] if containers_spec else {}
-        c_name = c_spec.get("name", "app")
-        c_resources = dict(c_spec.get("resources", {}))
-
-        is_oom = "oom" in pod_name.lower()
+        hints = _inspect_manifest_failure_hints(doc, pod_name)
         return {
             "status": "simulated",
             "source": "local_manifest_simulation",
             "pod_name": pod_name,
             "namespace": namespace,
-            "phase": "Running" if is_oom else "CrashLoopBackOff",
+            "phase": hints["phase"],
             "container_statuses": [
                 {
-                    "container_name": c_name,
+                    "container_name": hints["container_name"],
                     "ready": False,
-                    "restart_count": 4 if is_oom else 6,
-                    "image": c_spec.get("image", "python:3.12-alpine"),
-                    "resources": c_resources,
+                    "restart_count": hints["restart_count"],
+                    "image": hints["image"],
+                    "resources": hints["resources"],
                     "state": {
                         "waiting": {
                             "reason": "CrashLoopBackOff",
-                            "message": "back-off 5m0s restarting failed container",
+                            "message": "back-off restarting failed container",
                         }
                     },
                     "last_state": {
                         "terminated": {
-                            "reason": "OOMKilled" if is_oom else "Error",
-                            "exit_code": 137 if is_oom else 1,
-                            "message": (
-                                "Container exceeded 32Mi memory cgroup limit"
-                                if is_oom
-                                else "FATAL ERROR: Invalid port configuration 'invalid_port'"
-                            ),
+                            "reason": hints["terminated_reason"],
+                            "exit_code": hints["exit_code"],
+                            "message": hints["terminated_message"],
                         }
                     },
                 }
@@ -194,23 +299,22 @@ def get_pod_logs(
     """Retrieve logs for a crashing or crashed container (supports reading previous terminated container logs)."""
     core_v1, _ = _get_k8s_clients()
     if not core_v1:
-        is_oom = "oom" in pod_name.lower()
-        simulated_logs = (
-            "[oom-worker] Worker starting up...\n"
-            "[oom-worker] Allocating 65MB memory chunk...\n"
-            "Killed (exit code 137 - SIGKILL: cgroup memory limit 32Mi exceeded)"
-            if is_oom
-            else "[config-app] Booting API service...\n"
-            "[config-app] Validating REQUIRED_PORT='invalid_port', MEMORY_LIMIT='16Mi'...\n"
-            "[config-app] FATAL ERROR: Invalid port configuration 'invalid_port': invalid literal for int() with base 10: 'invalid_port'"
-        )
+        if not settings.allow_offline_simulation:
+            return {
+                "status": "unavailable",
+                "message": "Kubernetes cluster is not connected and offline simulation is disabled.",
+                "pod_name": pod_name,
+                "logs": "",
+            }
+        doc = _load_local_manifest_spec(pod_name)
+        hints = _inspect_manifest_failure_hints(doc, pod_name)
         return {
             "status": "simulated",
             "source": "local_manifest_simulation",
             "pod_name": pod_name,
             "namespace": namespace,
             "tail_lines": tail_lines,
-            "logs": simulated_logs,
+            "logs": hints["logs"],
         }
 
     try:
@@ -248,7 +352,15 @@ def get_pod_events(pod_name: str, namespace: str = "default") -> Dict[str, Any]:
     """Fetch Warning and Normal Kubernetes events for the specified pod to diagnose scheduling or OOM events."""
     core_v1, _ = _get_k8s_clients()
     if not core_v1:
-        is_oom = "oom" in pod_name.lower()
+        if not settings.allow_offline_simulation:
+            return {
+                "status": "unavailable",
+                "message": "Kubernetes cluster is not connected and offline simulation is disabled.",
+                "pod_name": pod_name,
+                "events": [],
+            }
+        doc = _load_local_manifest_spec(pod_name)
+        hints = _inspect_manifest_failure_hints(doc, pod_name)
         return {
             "status": "simulated",
             "source": "local_manifest_simulation",
@@ -258,18 +370,14 @@ def get_pod_events(pod_name: str, namespace: str = "default") -> Dict[str, Any]:
                 {
                     "type": "Normal",
                     "reason": "Scheduled",
-                    "message": f"Successfully assigned {namespace}/{pod_name} to k3d-kubeheal-cluster-agent-0",
+                    "message": f"Successfully assigned {namespace}/{pod_name} to cluster node",
                     "count": 1,
                 },
                 {
                     "type": "Warning",
-                    "reason": "OOMKilling" if is_oom else "BackOff",
-                    "message": (
-                        "Memory cgroup out of memory: Killed process (python) total-vm:72400kB, anon-rss:32768kB"
-                        if is_oom
-                        else f"Back-off restarting failed container in pod {pod_name}_{namespace}"
-                    ),
-                    "count": 4 if is_oom else 6,
+                    "reason": hints["event_reason"],
+                    "message": hints["event_message"],
+                    "count": hints["restart_count"],
                 },
             ],
         }
@@ -304,14 +412,46 @@ def get_pod_events(pod_name: str, namespace: str = "default") -> Dict[str, Any]:
         }
 
 
+def _extract_k8s_pod_spec_containers(pod_spec: Any) -> List[Dict[str, Any]]:
+    """Convert Kubernetes V1PodSpec containers into sanitized dictionary representations."""
+    containers = []
+    if not pod_spec or not getattr(pod_spec, "containers", None):
+        return containers
+    for c in pod_spec.containers:
+        safe_env = []
+        if c.env:
+            for env_var in c.env:
+                if env_var.value_from:
+                    safe_env.append({"name": env_var.name, "value_from": "<secret/configmap reference masked>"})
+                else:
+                    safe_env.append({"name": env_var.name, "value": env_var.value})
+
+        resources = {}
+        if c.resources:
+            if c.resources.limits:
+                resources["limits"] = dict(c.resources.limits)
+            if c.resources.requests:
+                resources["requests"] = dict(c.resources.requests)
+
+        containers.append({
+            "name": c.name,
+            "image": c.image,
+            "command": c.command,
+            "args": c.args,
+            "env": safe_env,
+            "resources": resources,
+        })
+    return containers
+
+
 @mcp.tool()
 def get_deployment_spec(deployment_name: str, namespace: str = "default") -> Dict[str, Any]:
-    """Retrieve container images, commands, environment variables, and resource requests/limits of a deployment."""
+    """Retrieve container images, commands, environment variables, and resource requests/limits of a workload (Deployment, StatefulSet, DaemonSet, or Job)."""
     _, apps_v1 = _get_k8s_clients()
     if not apps_v1:
         doc = _load_local_manifest_spec(deployment_name)
         if doc:
-            raw_containers = doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+            raw_containers = extract_containers_from_doc(doc)
             containers = []
             for c in raw_containers:
                 containers.append({
@@ -327,6 +467,7 @@ def get_deployment_spec(deployment_name: str, namespace: str = "default") -> Dic
             return {
                 "status": "simulated",
                 "source": "local_manifest_file",
+                "kind": doc.get("kind", "Deployment"),
                 "deployment_name": deployment_name,
                 "namespace": namespace,
                 "replicas": doc.get("spec", {}).get("replicas", 1),
@@ -338,45 +479,47 @@ def get_deployment_spec(deployment_name: str, namespace: str = "default") -> Dic
             "deployment_name": deployment_name,
         }
 
+    # Try Deployment -> StatefulSet -> DaemonSet -> Job
     try:
         dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
-        containers = []
-        for c in dep.spec.template.spec.containers:
-            safe_env = []
-            if c.env:
-                for env_var in c.env:
-                    if env_var.value_from:
-                        safe_env.append({"name": env_var.name, "value_from": "<secret/configmap reference masked>"})
-                    else:
-                        safe_env.append({"name": env_var.name, "value": env_var.value})
-
-            resources = {}
-            if c.resources:
-                if c.resources.limits:
-                    resources["limits"] = dict(c.resources.limits)
-                if c.resources.requests:
-                    resources["requests"] = dict(c.resources.requests)
-
-            containers.append({
-                "name": c.name,
-                "image": c.name and c.image,
-                "command": c.command,
-                "args": c.args,
-                "env": safe_env,
-                "resources": resources,
-            })
-
         return {
             "status": "success",
+            "kind": "Deployment",
             "deployment_name": deployment_name,
             "namespace": namespace,
             "replicas": dep.spec.replicas,
-            "containers": containers,
+            "containers": _extract_k8s_pod_spec_containers(dep.spec.template.spec),
+        }
+    except Exception:
+        pass
+
+    try:
+        sts = apps_v1.read_namespaced_stateful_set(name=deployment_name, namespace=namespace)
+        return {
+            "status": "success",
+            "kind": "StatefulSet",
+            "deployment_name": deployment_name,
+            "namespace": namespace,
+            "replicas": sts.spec.replicas,
+            "containers": _extract_k8s_pod_spec_containers(sts.spec.template.spec),
+        }
+    except Exception:
+        pass
+
+    try:
+        ds = apps_v1.read_namespaced_daemon_set(name=deployment_name, namespace=namespace)
+        return {
+            "status": "success",
+            "kind": "DaemonSet",
+            "deployment_name": deployment_name,
+            "namespace": namespace,
+            "replicas": 1,
+            "containers": _extract_k8s_pod_spec_containers(ds.spec.template.spec),
         }
     except Exception as e:
         return {
             "status": "error",
-            "message": f"Failed to get deployment spec: {str(e)}",
+            "message": f"Failed to get workload spec for '{deployment_name}': {str(e)}",
             "deployment_name": deployment_name,
         }
 

@@ -633,6 +633,8 @@
   <script>
     let incidents = [];
     let activeIncidentId = null;
+    let currentGroqModel = "openai/gpt-oss-120b";
+    let currentMaxMemoryCap = "1Gi";
 
     function notify(message, isError = false) {
       const el = document.getElementById("statusToast");
@@ -646,6 +648,8 @@
       try {
         const res = await fetch("/api/health");
         const h = await res.json();
+        if (h.groq_model) currentGroqModel = h.groq_model;
+        if (h.guardrails && h.guardrails.max_memory_cap) currentMaxMemoryCap = h.guardrails.max_memory_cap;
         const container = document.getElementById("telemetryPills");
         container.innerHTML = `
           <span class="pill pill-jade">
@@ -789,7 +793,7 @@
         <div class="panel-card">
           <div class="panel-heading">
             <span>Root Cause Diagnosis</span>
-            <span style="font-family:var(--font-mono); font-size:12px; color:var(--ink-muted);">Model: openai/gpt-oss-120b</span>
+            <span style="font-family:var(--font-mono); font-size:12px; color:var(--ink-muted);">Model: ${escapeHtml(currentGroqModel)}</span>
           </div>
           <div class="diagnosis-prose">${escapeHtml(inc.root_cause_summary)}</div>
         </div>
@@ -858,7 +862,7 @@
                 <span>3. GitOps Human-in-the-Loop</span>
                 <span class="status-pass">Enforced</span>
               </div>
-              <p style="color:var(--ink-secondary);">Zero direct cluster mutation. Memory limits are clamped to a 1Gi ceiling and proposed via Pull Request.</p>
+              <p style="color:var(--ink-secondary);">Zero direct cluster mutation. Memory limits are clamped to a ${escapeHtml(currentMaxMemoryCap)} ceiling and proposed via Pull Request.</p>
             </div>
           </div>
         </div>

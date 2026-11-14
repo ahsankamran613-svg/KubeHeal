@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     watcher_poll_interval_seconds: int = Field(default=15, description="Watcher polling interval in seconds")
     alert_cooldown_seconds: int = Field(default=300, description="Deduplication cooldown for alerts")
     manifests_dir: str = Field(default="k8s/workloads", description="Directory where workload YAML manifests live")
+    repo_root_dir: str = Field(default=".", description="Repository root directory for computing relative Git paths")
+
+    # Remediation Guardrail Caps
+    max_memory_limit: str = Field(default="1Gi", description="Maximum safe memory ceiling for automated remediation")
+    min_memory_limit: str = Field(default="16Mi", description="Minimum safe memory floor for automated remediation")
+    allow_offline_simulation: bool = Field(
+        default=True,
+        description="Allow manifest-backed telemetry simulation when no live Kubernetes cluster is reachable",
+    )
 
     # GitHub PR Automation & GitOps
     github_token: Optional[str] = Field(default=None, description="GitHub Personal Access Token")

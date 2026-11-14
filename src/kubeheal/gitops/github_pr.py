@@ -1,11 +1,26 @@
 """GitHub Pull Request creator and local proposal bundle generator."""
 
 import json
+import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from kubeheal.config import settings
 from kubeheal.models import AlertPayload, MCPToolExecution, YAMLModification
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_repo_relative_path(manifest_path: Path, repo_root: Optional[str] = None) -> str:
+    """Resolve the repository-relative POSIX path for a manifest file regardless of folder naming."""
+    root = Path(repo_root or settings.repo_root_dir).resolve()
+    try:
+        resolved_manifest = manifest_path.resolve()
+        return resolved_manifest.relative_to(root).as_posix()
+    except ValueError:
+        # Fallback if manifest_path is already relative or outside root
+        raw_posix = manifest_path.as_posix().lstrip("./")
+        return raw_posix
 
 
 def generate_pr_markdown_body(
@@ -19,8 +34,9 @@ def generate_pr_markdown_body(
     """Generate structured markdown body for the GitHub PR or local proposal."""
     mod_lines = []
     for m in modifications:
+        c_tag = f" (container `{m.container_name}`)" if m.container_name else ""
         mod_lines.append(
-            f"- **`{m.parameter_path}`**: changed from `{m.old_value}` to `{m.new_value}`\n  *Rationale*: {m.rationale}"
+            f"- **`{m.parameter_path}`**{c_tag}: changed from `{m.old_value}` to `{m.new_value}`\n  *Rationale*: {m.rationale}"
         )
     mod_section = "\n".join(mod_lines) if mod_lines else "No specific YAML modifications recorded."
 
@@ -63,7 +79,7 @@ def generate_pr_markdown_body(
 ## 📋 Guardrail Verification Checklist
 - [x] **Strict Read-Only Inspection**: MCP server verified zero mutating verbs (`delete`, `apply`, `patch`, `edit`, `exec`) were executed.
 - [x] **RBAC Isolation**: Inspected via `kubeheal-reader` service account restricted to `get`, `list`, `watch`.
-- [x] **Safe Remediation Caps**: Resource limits validated against safe infrastructure ceilings (Max Memory <= 1Gi).
+- [x] **Safe Remediation Caps**: Resource limits validated against safe infrastructure ceilings (Max Memory <= {settings.max_memory_limit}).
 - [x] **GitOps Human-in-the-Loop**: Live cluster was NOT mutated directly; changes require code review and Git merge.
 
 ---
@@ -140,13 +156,10 @@ def create_remediation_proposal(
                 sha=base_branch.commit.sha,
             )
 
-            # Get relative path of manifest in repo
-            # Normalize path relative to project root
-            repo_file_path = str(manifest_path).replace("\\", "/")
-            if "k8s/" in repo_file_path:
-                repo_file_path = repo_file_path[repo_file_path.index("k8s/"):]
+            # Resolve accurate repository-relative file path
+            repo_file_path = resolve_repo_relative_path(manifest_path)
 
-            # Get current file sha on base branch
+            # Get current file sha on branch
             file_contents = repo.get_contents(repo_file_path, ref=branch_name)
 
             # Commit changes to branch
@@ -170,7 +183,7 @@ def create_remediation_proposal(
             pr_url = pr.html_url
 
         except Exception as e:
-            # If GitHub PR creation fails, log and fallback to local proposal
+            logger.warning(f"GitHub PR creation failed ({e}); local proposal saved at {base_dir}")
             pr_url = None
 
     return pr_url, str(base_dir)

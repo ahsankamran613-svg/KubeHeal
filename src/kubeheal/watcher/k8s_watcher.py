@@ -1,14 +1,26 @@
-"""Background Kubernetes watcher for CrashLoopBackOff and OOMKilled pods with cooldown deduplication."""
+"""Background Kubernetes watcher for crashing pods with ownerReference resolution and cooldown deduplication."""
 
 import asyncio
 import logging
 import time
-from typing import Callable, Coroutine, Dict, Optional
+from typing import Callable, Coroutine, Dict, Optional, Set
 
 from kubeheal.config import settings
+from kubeheal.gitops.yaml_patcher import infer_workload_name_from_pod
 from kubeheal.models import AlertPayload
 
 logger = logging.getLogger(__name__)
+
+FAILURE_WAITING_REASONS: Set[str] = {
+    "CrashLoopBackOff",
+    "Error",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+    "RunContainerError",
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "InvalidImageName",
+}
 
 
 class KubernetesWatcher:
@@ -62,8 +74,8 @@ class KubernetesWatcher:
 
         for pod in pod_list.items:
             pod_name = pod.metadata.name
-            # Infer deployment name from pod name prefix (e.g. oom-crash-app-7598c9f566-abcde -> oom-crash-app)
-            dep_name = pod_name.rsplit("-", 2)[0] if "-" in pod_name else pod_name
+            owner_refs = getattr(pod.metadata, "owner_references", None)
+            dep_name = infer_workload_name_from_pod(pod_name, owner_references=owner_refs)
             target_key = f"{self.namespace}/{dep_name}"
 
             if not pod.status.container_statuses:
@@ -72,12 +84,8 @@ class KubernetesWatcher:
             for cs in pod.status.container_statuses:
                 alert: Optional[AlertPayload] = None
 
-                # Check 1: Waiting container in CrashLoopBackOff or Error state
-                if cs.state.waiting and cs.state.waiting.reason in (
-                    "CrashLoopBackOff",
-                    "Error",
-                    "CreateContainerConfigError",
-                ):
+                # Check 1: Waiting container in any failure state
+                if cs.state.waiting and cs.state.waiting.reason in FAILURE_WAITING_REASONS:
                     exit_code = None
                     if cs.last_state and cs.last_state.terminated:
                         exit_code = cs.last_state.terminated.exit_code
@@ -93,10 +101,17 @@ class KubernetesWatcher:
                         message=cs.state.waiting.message or f"Pod container {cs.name} is in {cs.state.waiting.reason}",
                     )
 
-                # Check 2: Terminated container with OOMKilled or non-zero exit code
-                elif cs.last_state and cs.last_state.terminated:
-                    term = cs.last_state.terminated
-                    if term.reason == "OOMKilled" or term.exit_code in (137, 1):
+                # Check 2: Currently terminated or last_state terminated with OOMKilled or ANY non-zero exit code
+                else:
+                    term = None
+                    if cs.state.terminated and (cs.state.terminated.reason == "OOMKilled" or (cs.state.terminated.exit_code is not None and cs.state.terminated.exit_code != 0)):
+                        term = cs.state.terminated
+                    elif cs.last_state and cs.last_state.terminated:
+                        t_candidate = cs.last_state.terminated
+                        if t_candidate.reason == "OOMKilled" or (t_candidate.exit_code is not None and t_candidate.exit_code != 0):
+                            term = t_candidate
+
+                    if term is not None:
                         alert = AlertPayload(
                             pod_name=pod_name,
                             namespace=self.namespace,

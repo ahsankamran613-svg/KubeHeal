@@ -90,3 +90,61 @@ def test_incidents_list(client: TestClient):
     incidents = response.json()
     assert isinstance(incidents, list)
     assert len(incidents) >= 1
+
+
+def test_custom_workload_webhook_no_hardcoded_port(client: TestClient, tmp_path, monkeypatch):
+    """Verify a real user's StatefulSet or custom app crashing with exit code 127 or 256Mi OOM
+    is dynamically diagnosed without injecting hardcoded REQUIRED_PORT or shrinking memory to 128Mi."""
+    from kubeheal.config import settings
+    from kubeheal.watcher.k8s_watcher import FAILURE_WAITING_REASONS
+
+    assert "ImagePullBackOff" in FAILURE_WAITING_REASONS
+    assert "RunContainerError" in FAILURE_WAITING_REASONS
+
+    # Create a custom StatefulSet manifest with 256Mi memory limit
+    custom_manifest = tmp_path / "analytics-worker.yaml"
+    custom_manifest.write_text(
+        """apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: analytics-worker
+  namespace: default
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: istio-proxy
+          image: istio/proxyv2:1.20
+        - name: engine
+          image: python:3.12-slim
+          resources:
+            requests:
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "manifests_dir", str(tmp_path))
+
+    # Send OOM alert for StatefulSet pod 'analytics-worker-0'
+    response = client.post(
+        "/api/webhook/alert",
+        json={
+            "pod_name": "analytics-worker-0",
+            "namespace": "default",
+            "container_name": "engine",
+            "reason": "OOMKilled",
+            "exit_code": 137,
+            "restart_count": 2,
+            "message": "Container engine exceeded its 256Mi memory limit",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["alert"]["deployment_name"] == "analytics-worker"
+    # Should scale 256Mi -> 512Mi (2x), NOT hardcode 32Mi -> 128Mi!
+    assert "+              memory: 512Mi" in data["yaml_diff"] or "+            memory: 512Mi" in data["yaml_diff"]
+    assert "REQUIRED_PORT" not in data["yaml_diff"]
+
