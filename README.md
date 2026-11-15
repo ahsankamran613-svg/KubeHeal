@@ -11,47 +11,149 @@
 
 ---
 
+## 🏗️ Complete System Architecture
+
+The diagram below maps every subsystem, module, API route, MCP tool, guardrail layer, data model, configuration source, cluster resource, GitOps output, and CI/container workflow in KubeHeal:
+
+```mermaid
+%%{init: {'flowchart': {'nodeSpacing': 24, 'rankSpacing': 38, 'curve': 'basis', 'padding': 12}}}%%
+flowchart TB
+    subgraph DEVCI["Dev, Containerization & CI/CD"]
+        DEVENV["Codespaces & Local Cluster Scripts<br/>.devcontainer/devcontainer.json (Py 3.12, DinD, k3d)<br/>scripts/setup-k3d.ps1 & .sh (kubeheal-cluster)"]
+        PKG["Container & Packaging<br/>Dockerfile (python:3.12-slim + kubectl + uvicorn)<br/>pyproject.toml & requirements.txt"]
+        CIVAL["GitHub Actions CI & Pytest Suite<br/>.github/workflows/ci-validate.yml (pytest -v)<br/>tests/: guardrails | yaml_patcher<br/>webhook_and_agent | agent_prehydration"]
+    end
+
+    subgraph K8S["Kubernetes Cluster (k3d / In-Cluster) — Layer 2 RBAC Isolation"]
+        WORKLOADS["Monitored K8s Workloads (8 Kinds)<br/>Deployment, StatefulSet, DaemonSet, Job,<br/>CronJob, Pod, ReplicaSet, Rollout<br/>Demos: oom-crash-app (32Mi → Exit 137)<br/>& config-crash-app (bad port → Exit 1)"]
+        K8SAPI["Kubernetes API Server<br/>CoreV1Api | AppsV1Api | BatchV1Api | metrics.k8s.io"]
+        RBAC["Layer 2 Safety: Cluster RBAC<br/>k8s/rbac/readonly-triage-rbac.yaml<br/>ServiceAccount: kubeheal-reader + Binding<br/>ClusterRole verbs ONLY: get, list, watch"]
+        IN_CLUSTER["In-Cluster Agent Deployment<br/>k8s/agent/agent-deployment.yaml<br/>Deployment: kubeheal-agent (sa: kubeheal-reader)<br/>Service: kubeheal-service (:8000) | kubeheal-secrets"]
+    end
+
+    subgraph EXT["External Triggers & Operator"]
+        OPERATOR["Human Operator / SRE<br/>Browser UI (http://localhost:8000)"]
+        WEBHOOK_SRC["External Alert Source<br/>Alertmanager / Monitoring<br/>POST JSON AlertPayload"]
+    end
+
+    subgraph CORE["Configuration & Data Contracts (src/kubeheal/)"]
+        CONFIG["Settings Loader (config.py + .env / .env.example)<br/>LLM provider & pacing | K8s watcher & paths<br/>Memory caps (16Mi–1Gi) | Offline sim | GitHub PR"]
+        MODELS["Pydantic v2 Contracts (models.py)<br/>AlertPayload | MCPToolExecution<br/>YAMLModification | TriageReport"]
+    end
+
+    subgraph WEB["Ingestion, Background Watcher & FastAPI Web Layer"]
+        DASHBOARD["Live Triage Web Console (static/index.html)<br/>Telemetry Pills | OOM & CrashLoop Sim Buttons<br/>Guardrail Probe & Verdict Drawer | Timeline<br/>MCP Trace Table | Diff Viewer | 3-Layer Compliance"]
+        FASTAPI["FastAPI Backend (main.py + lifespan)<br/>GET / | /api/health | /api/incidents/{id}<br/>POST /api/webhook/alert | /api/simulate/{scenario}<br/>POST /api/guardrail-test → handle_alert()"]
+        WATCHER["Background K8s Watcher (watcher/k8s_watcher.py)<br/>KubernetesWatcher (when ENABLE_K8S_WATCHER=true)<br/>Polls pods | Waiting failures & OOM/non-zero exits<br/>ownerReferences lookup + _cooldown_cache"]
+        STORES["In-Memory Stores (main.py)<br/>incident_store (Dict of TriageReport)<br/>guardrail_audit_log (List of MCPToolExecution)"]
+    end
+
+    subgraph AGENT["AI Triage Orchestrator (src/kubeheal/agent/triage_agent.py)"]
+        PIPELINE["run_triage_pipeline(alert)<br/>1. Infer workload & locate manifest YAML<br/>2. Pre-hydrate 4 baseline MCP tools<br/>3. Compact logs & run paced diagnosis<br/>4. Patch YAML & emit PR / Proposal"]
+        PREHYDRATE["Pre-Hydration & Compaction<br/>gather_baseline_mcp_telemetry()<br/>compact_telemetry_for_llm()<br/>compact_log_text() (dedupe + char cap)"]
+        DISCOVERY["Dynamic MCP Tool Discovery<br/>discover_mcp_tools_for_gemini()<br/>discover_mcp_tools_for_groq()<br/>5 MCP tools + submit_triage_solution"]
+        LLM_LOOP["Paced Multi-Turn LLM Loop<br/>_run_llm_triage_loop_with_metadata()<br/>resolve_llm_config() (auto → Gemini → Groq)<br/>asyncio.Semaphore pacing & max_turns=4"]
+        PROVIDERS["LLM Provider Sessions<br/>GeminiProviderSession (google-genai)<br/>gemini-3.5-flash-lite + thought_signature<br/>GroqProviderSession (AsyncGroq)<br/>openai/gpt-oss-120b + parallel calls"]
+        FALLBACK["Deterministic Fallback Engine<br/>_deterministic_fallback_triage()<br/>If keys unset, LLM errors, or turns exhausted:<br/>OOM 4x/2x | *PORT* env | Image tag | Generic cap"]
+    end
+
+    subgraph MCP["Guardrailed MCP Server — Layer 1 Code Safety (src/kubeheal/mcp_server/)"]
+        MCPSERVER["MCPServer 'kubeheal-k8s-mcp' (server.py)<br/>execute_mcp_tool_call() → MCPToolExecution<br/>5 Read-Only Tools: get_pod_status | get_pod_logs<br/>get_pod_events | get_deployment_spec (masks valueFrom)<br/>run_readonly_kubectl (subprocess)"]
+        GUARDRAIL["Layer 1 Safety: Code Guardrail (guardrails.py)<br/>validate_kubectl_command()<br/>Allowlist: get, describe, logs, events, top<br/>Blocks 21 write verbs, shell metacharacters,<br/>secrets/sa/roles, --token/--kubeconfig/--as,<br/>jsonpath / go-template / custom-columns"]
+        SIMENGINE["Cluster vs Offline Simulation Router<br/>_get_k8s_clients() live API probe<br/>Offline mode (ALLOW_OFFLINE_SIMULATION=true):<br/>resolve_simulation_alert()<br/>_inspect_manifest_failure_hints()"]
+    end
+
+    subgraph GITOPS["GitOps Remediation & PR Delivery — Layer 3 Human-in-the-Loop (src/kubeheal/gitops/)"]
+        REPO_FILES["Manifest Repository<br/>MANIFESTS_DIR: k8s/workloads/ | REPO_ROOT_DIR: .<br/>Recursive nested & multi-doc *.yaml / *.yml"]
+        PATCHER["Safe YAML Patcher (yaml_patcher.py)<br/>find_manifest_for_deployment() (8 kinds)<br/>select_target_container() (skips sidecars)<br/>patch_deployment_yaml() via ruamel.yaml<br/>Edits resources, env, image, command, args, replicas"]
+        MEMCAP["Layer 3 Memory Bounds & Diff<br/>clamp_memory_limit() & get_memory_guardrail_bounds()<br/>Bounds: MIN 16Mi..MAX 1Gi (never shrinks >= max)<br/>Generates diff via difflib.unified_diff"]
+        PRSERVICE["Proposal & PR Builder (github_pr.py)<br/>create_remediation_proposal()<br/>generate_pr_markdown_body()<br/>resolve_repo_relative_path() + Safety Checklist"]
+        LOCALOUT["Local Proposal Bundle (Always Saved)<br/>output/proposals/{incident_id}/<br/>Patched manifest | patch.diff | PROPOSAL.md"]
+        GITHUBPR["Live GitHub Pull Request (PyGithub)<br/>If DRY_RUN_MODE=false + GITHUB_TOKEN<br/>Branch fix/kubeheal-{id} → Commit → PR<br/>Human Review & Merge (Zero Direct Cluster Writes)"]
+    end
+
+    DEVENV -->|"Provisions k3d + demos"| WORKLOADS
+    CIVAL -.->|"Validates tests & code"| PKG
+    PKG -->|"Builds image"| IN_CLUSTER
+
+    WORKLOADS -->|"Crash states & logs"| K8SAPI
+    RBAC -.->|"Restricts verbs"| K8SAPI
+    IN_CLUSTER -.->|"Binds SA"| RBAC
+    IN_CLUSTER -->|"Runs FastAPI"| FASTAPI
+
+    OPERATOR <-->|"Web UI"| DASHBOARD
+    DASHBOARD <-->|"REST API"| FASTAPI
+    WEBHOOK_SRC -->|"POST /api/webhook/alert"| FASTAPI
+    K8SAPI -->|"Polls pods"| WATCHER
+    WATCHER -->|"handle_alert()"| PIPELINE
+    FASTAPI -->|"Stores & reads"| STORES
+    FASTAPI <-->|"Triage & TriageReport"| PIPELINE
+    FASTAPI -->|"Probes kubectl"| GUARDRAIL
+    FASTAPI -->|"Resolves sim"| SIMENGINE
+
+    CONFIG -.->|"Configures"| FASTAPI
+    CONFIG -.->|"Configures"| AGENT
+    MODELS -.->|"Typed schemas"| FASTAPI
+
+    PIPELINE --> PREHYDRATE
+    PREHYDRATE -->|"4 baseline calls"| MCPSERVER
+    PIPELINE --> DISCOVERY
+    DISCOVERY -->|"Tool schemas"| LLM_LOOP
+    PIPELINE --> LLM_LOOP
+    LLM_LOOP --> PROVIDERS
+    PROVIDERS <-->|"Follow-up MCP calls"| MCPSERVER
+    LLM_LOOP -.->|"Fallback on unset/error/timeout"| FALLBACK
+
+    MCPSERVER -->|"Validates CLI"| GUARDRAIL
+    GUARDRAIL -->|"Approved kubectl"| K8SAPI
+    MCPSERVER -->|"Queries live or sim"| SIMENGINE
+    SIMENGINE <-->|"Read-only K8s API"| K8SAPI
+    SIMENGINE -->|"Reads local YAML"| REPO_FILES
+
+    PROVIDERS -->|"YAMLModification[]"| PATCHER
+    FALLBACK -->|"YAMLModification[]"| PATCHER
+    REPO_FILES -->|"Target manifest"| PATCHER
+    PATCHER --> MEMCAP
+    MEMCAP -->|"Patched YAML + Diff"| PRSERVICE
+    PRSERVICE --> LOCALOUT
+    PRSERVICE -->|"If DRY_RUN_MODE=false"| GITHUBPR
+    GITHUBPR -->|"Human review & merge"| REPO_FILES
+
+    linkStyle default stroke:#64748b,stroke-width:1.6px;
+
+    classDef k8sStyle fill:#0c4a6e,stroke:#38bdf8,stroke-width:1.5px,color:#f0f9ff;
+    classDef safetyStyle fill:#881337,stroke:#fb7185,stroke-width:2px,color:#fff1f2;
+    classDef webStyle fill:#1e293b,stroke:#60a5fa,stroke-width:1.5px,color:#f8fafc;
+    classDef agentStyle fill:#4c1d95,stroke:#c084fc,stroke-width:1.5px,color:#faf5ff;
+    classDef mcpStyle fill:#065f46,stroke:#34d399,stroke-width:1.5px,color:#ecfdf5;
+    classDef gitopsStyle fill:#14532d,stroke:#4ade80,stroke-width:1.5px,color:#f0fdf4;
+    classDef coreStyle fill:#312e81,stroke:#818cf8,stroke-width:1.5px,color:#eef2ff;
+    classDef devStyle fill:#334155,stroke:#94a3b8,stroke-width:1.5px,color:#f8fafc;
+
+    class WORKLOADS,K8SAPI,IN_CLUSTER k8sStyle;
+    class RBAC,GUARDRAIL,MEMCAP safetyStyle;
+    class WEBHOOK_SRC,OPERATOR,WATCHER,FASTAPI,STORES,DASHBOARD webStyle;
+    class PIPELINE,PREHYDRATE,DISCOVERY,LLM_LOOP,PROVIDERS,FALLBACK agentStyle;
+    class MCPSERVER,SIMENGINE mcpStyle;
+    class REPO_FILES,PATCHER,PRSERVICE,LOCALOUT,GITHUBPR gitopsStyle;
+    class CONFIG,MODELS coreStyle;
+    class DEVENV,PKG,CIVAL devStyle;
+
+    style DEVCI fill:#64748b16,stroke:#64748b,stroke-width:1.5px;
+    style K8S fill:#0284c716,stroke:#0284c7,stroke-width:1.5px;
+    style EXT fill:#64748b16,stroke:#64748b,stroke-width:1.5px;
+    style CORE fill:#6366f116,stroke:#6366f1,stroke-width:1.5px;
+    style WEB fill:#3b82f616,stroke:#3b82f6,stroke-width:1.5px;
+    style AGENT fill:#a855f716,stroke:#a855f7,stroke-width:1.5px;
+    style MCP fill:#10b98116,stroke:#10b981,stroke-width:1.5px;
+    style GITOPS fill:#22c55e16,stroke:#22c55e,stroke-width:1.5px;
+```
+
+---
+
 ## 🔒 How KubeHeal Stays Safe (3 Safety Layers)
 
-```
-                                  [ Crashing Pod ]
-                          (OOMKilled / CrashLoop / Err)
-                                         │
-                                         ▼
-                            [ Kubernetes Pod Watcher ]
-                                         │
-                                         ▼
-                             [ KubeHeal Web Backend ]
-                                         │
-                      ┌──────────────────┴──────────────────┐
-                      ▼                                     ▼
-               [ AI Triage Agent ]                [ Live Web Dashboard ]
-           (Gemini 3.5 Flash-Lite / Groq)         - Real-time Alerts
-                      │                           - Safety Check Logs
-                      │ Read-Only Checks          - YAML Diff Preview
-                      ▼                           - Pull Request Links
-          ┌───────────────────────┐
-          │   Custom MCP Server   │
-          │ 🛡️ Layer 1: Code Rule │ ──► Blocks: delete, apply, exec, shell tricks, secrets
-          └───────────┬───────────┘
-                      │
-                      ▼
-          ┌───────────────────────┐
-          │  Kubernetes Cluster   │
-          │ 🛡️ Layer 2: K8s RBAC  │ ──► Account: kubeheal-reader (get, list, watch only)
-          └───────────┬───────────┘
-                      │ Root Cause Found
-                      ▼
-          ┌───────────────────────┐
-          │   YAML Fix Builder    │
-          │ 🛡️ Layer 3: GitOps PR │ ──► ruamel.yaml + safe memory limits
-          └───────────┬───────────┘
-                      │
-           ┌──────────┴──────────┐
-           ▼                     ▼
-     [ GitHub PR ]       [ Local Preview ]
-   (Branch + Commit)    (output/proposals/*)
-```
+KubeHeal enforces defense-in-depth across the three red safety boundaries highlighted in the architecture diagram above:
 
 1. **Command Safety Check (Code Level)**: The AI can only run safe, read-only tools and `kubectl` commands (`get`, `describe`, `logs`, `events`, `top`). Any command that changes things (`delete`, `apply`, `patch`, `edit`, `exec`, `scale`), uses shell tricks (`;`, `|`, `&`, `>`, `$`), tries to read secrets or roles (`secrets`, `serviceaccounts`, `roles`), uses admin flags (`--token`, `--kubeconfig`, `--as`), or dumps hidden data (`jsonpath`, `go-template`, `custom-columns`) is blocked right away.
 2. **Cluster Permission Lock (Kubernetes RBAC)**: Inside Kubernetes, the `kubeheal-reader` account only has read-only permission (`get`, `list`, `watch`) on core resources, `apps` (`deployments`, `replicasets`, `statefulsets`, `daemonsets`), and `batch` (`jobs`, `cronjobs`), plus read-only metrics (`get`, `list` on `metrics.k8s.io`). Even if something tried to change the cluster, Kubernetes itself would block it.
