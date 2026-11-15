@@ -14,6 +14,67 @@ PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
     DETERMINISTIC_ENGINE_NAME: "Deterministic Diagnostic Engine",
 }
 
+DEFAULT_KUBE_NAMESPACE = "default"
+DEFAULT_WATCHER_POLL_INTERVAL_SECONDS = 15
+DEFAULT_ALERT_COOLDOWN_SECONDS = 300
+DEFAULT_MANIFESTS_DIR = "k8s/workloads"
+DEFAULT_REPO_ROOT_DIR = "."
+DEFAULT_PROPOSALS_DIR = "output/proposals"
+DEFAULT_GITHUB_BASE_BRANCH = "main"
+DEFAULT_PROJECT_URL = "https://github.com/KubeHeal"
+
+DEFAULT_MAX_MEMORY_LIMIT = "1Gi"
+DEFAULT_MIN_MEMORY_LIMIT = "16Mi"
+DEFAULT_FALLBACK_MEMORY_LIMIT = "32Mi"
+DEFAULT_FALLBACK_MEMORY_REQUEST = "16Mi"
+DEFAULT_SAFE_REQUEST_FALLBACK = "64Mi"
+DEFAULT_UNPARSEABLE_MEMORY_FALLBACK = "128Mi"
+DEFAULT_SMALL_MEMORY_THRESHOLD = "128Mi"
+DEFAULT_SMALL_MEMORY_SCALE_FACTOR = 4
+DEFAULT_LARGE_MEMORY_SCALE_FACTOR = 2
+
+DEFAULT_REMEDIATION_PORT = "8080"
+DEFAULT_PORT_ENV_KEY = "REQUIRED_PORT"
+DEFAULT_MEMORY_ENV_KEY = "MEMORY_LIMIT"
+DEFAULT_INVALID_PORT_PLACEHOLDER = "invalid_port"
+DEFAULT_IMAGE_TAG_FALLBACK = "latest"
+
+DEFAULT_K8S_API_TIMEOUT_SECONDS = 2
+DEFAULT_KUBECTL_TIMEOUT_SECONDS = 10
+DEFAULT_POD_LOG_TAIL_LINES = 100
+DEFAULT_GUARDRAIL_PROBE_COMMAND = "kubectl delete pod --all -n default"
+
+OOM_SCENARIO_KEY = "oom-crash"
+CONFIG_SCENARIO_KEY = "config-crash"
+DEFAULT_OOM_SCENARIO_WORKLOAD = "oom-crash-app"
+DEFAULT_CONFIG_SCENARIO_WORKLOAD = "config-crash-app"
+DEFAULT_SIMULATED_POD_SUFFIX = "sim01"
+
+OOM_EXIT_CODE = 137
+DEFAULT_ERROR_EXIT_CODE = 1
+DEFAULT_OOM_SIM_RESTART_COUNT = 4
+DEFAULT_CONFIG_SIM_RESTART_COUNT = 5
+DEFAULT_GENERIC_SIM_RESTART_COUNT = 3
+
+DEFAULT_OOM_CONFIDENCE = 0.98
+DEFAULT_CONFIG_CONFIDENCE = 0.96
+DEFAULT_IMAGE_CONFIDENCE = 0.88
+DEFAULT_GENERIC_CONFIDENCE = 0.85
+DEFAULT_LLM_CONFIDENCE = 0.95
+DEFAULT_LLM_FALLBACK_CONFIDENCE = 0.90
+
+DEFAULT_INCIDENT_ID_LENGTH = 8
+DEFAULT_TRACE_PREVIEW_MAX_CHARS = 250
+DEFAULT_PR_TRACE_PREVIEW_MAX_CHARS = 80
+DEFAULT_RBAC_VERBS: Tuple[str, ...] = ("get", "list", "watch")
+DEFAULT_MCP_TOOL_NAMES: Tuple[str, ...] = (
+    "get_pod_status",
+    "get_pod_logs",
+    "get_pod_events",
+    "get_deployment_spec",
+    "run_readonly_kubectl",
+)
+
 
 class LLMProviderConfig(NamedTuple):
     """Resolved active LLM provider configuration."""
@@ -169,29 +230,127 @@ class Settings(BaseSettings):
     )
 
     # Kubernetes Settings
-    kube_namespace: str = Field(default="default", description="Default namespace to monitor")
+    kube_namespace: str = Field(default=DEFAULT_KUBE_NAMESPACE, description="Default namespace to monitor")
     enable_k8s_watcher: bool = Field(default=False, description="Enable automated cluster polling watcher")
-    watcher_poll_interval_seconds: int = Field(default=15, description="Watcher polling interval in seconds")
-    alert_cooldown_seconds: int = Field(default=300, description="Deduplication cooldown for alerts")
-    manifests_dir: str = Field(default="k8s/workloads", description="Directory where workload YAML manifests live")
-    repo_root_dir: str = Field(default=".", description="Repository root directory for computing relative Git paths")
+    watcher_poll_interval_seconds: int = Field(
+        default=DEFAULT_WATCHER_POLL_INTERVAL_SECONDS,
+        description="Watcher polling interval in seconds",
+    )
+    alert_cooldown_seconds: int = Field(
+        default=DEFAULT_ALERT_COOLDOWN_SECONDS,
+        description="Deduplication cooldown for alerts",
+    )
+    manifests_dir: str = Field(
+        default=DEFAULT_MANIFESTS_DIR,
+        description="Directory where workload YAML manifests live",
+    )
+    repo_root_dir: str = Field(
+        default=DEFAULT_REPO_ROOT_DIR,
+        description="Repository root directory for computing relative Git paths",
+    )
+    k8s_api_timeout_seconds: int = Field(
+        default=DEFAULT_K8S_API_TIMEOUT_SECONDS,
+        ge=1,
+        description="Timeout in seconds for Kubernetes API connectivity checks",
+    )
+    kubectl_timeout_seconds: int = Field(
+        default=DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+        ge=1,
+        description="Timeout in seconds for read-only kubectl subprocess execution",
+    )
 
-    # Remediation Guardrail Caps
-    max_memory_limit: str = Field(default="1Gi", description="Maximum safe memory ceiling for automated remediation")
-    min_memory_limit: str = Field(default="16Mi", description="Minimum safe memory floor for automated remediation")
+    # Remediation Guardrail Caps & Fallback Defaults
+    max_memory_limit: str = Field(
+        default=DEFAULT_MAX_MEMORY_LIMIT,
+        description="Maximum safe memory ceiling for automated remediation",
+    )
+    min_memory_limit: str = Field(
+        default=DEFAULT_MIN_MEMORY_LIMIT,
+        description="Minimum safe memory floor for automated remediation",
+    )
+    fallback_memory_limit: str = Field(
+        default=DEFAULT_FALLBACK_MEMORY_LIMIT,
+        description="Fallback baseline memory limit when container spec omits a memory limit",
+    )
+    fallback_memory_request: str = Field(
+        default=DEFAULT_FALLBACK_MEMORY_REQUEST,
+        description="Fallback baseline memory request when container spec omits a memory request",
+    )
+    safe_request_fallback: str = Field(
+        default=DEFAULT_SAFE_REQUEST_FALLBACK,
+        description="Fallback memory request if scaled memory limit cannot be parsed",
+    )
+    unparseable_memory_fallback: str = Field(
+        default=DEFAULT_UNPARSEABLE_MEMORY_FALLBACK,
+        description="Fallback memory limit when both proposed and existing memory strings are unparseable",
+    )
+    small_memory_threshold: str = Field(
+        default=DEFAULT_SMALL_MEMORY_THRESHOLD,
+        description="Memory threshold below which OOM scaling applies small_memory_scale_factor",
+    )
+    small_memory_scale_factor: int = Field(
+        default=DEFAULT_SMALL_MEMORY_SCALE_FACTOR,
+        ge=1,
+        description="Scaling multiplier applied to OOM memory limits below small_memory_threshold",
+    )
+    large_memory_scale_factor: int = Field(
+        default=DEFAULT_LARGE_MEMORY_SCALE_FACTOR,
+        ge=1,
+        description="Scaling multiplier applied to OOM memory limits at or above small_memory_threshold",
+    )
+    default_remediation_port: str = Field(
+        default=DEFAULT_REMEDIATION_PORT,
+        description="Default valid TCP port string used when remediating invalid port environment variables",
+    )
+    default_port_env_key: str = Field(
+        default=DEFAULT_PORT_ENV_KEY,
+        description="Default environment variable name inspected for port configuration errors",
+    )
+    default_memory_env_key: str = Field(
+        default=DEFAULT_MEMORY_ENV_KEY,
+        description="Environment variable name inspected for application-level memory thresholds",
+    )
+    default_image_tag_fallback: str = Field(
+        default=DEFAULT_IMAGE_TAG_FALLBACK,
+        description="Fallback container image tag proposed when an image pull fails",
+    )
+    default_guardrail_probe_command: str = Field(
+        default=DEFAULT_GUARDRAIL_PROBE_COMMAND,
+        description="Default kubectl command used in the guardrail verification probe",
+    )
     allow_offline_simulation: bool = Field(
         default=True,
         description="Allow manifest-backed telemetry simulation when no live Kubernetes cluster is reachable",
+    )
+    oom_scenario_workload: str = Field(
+        default=DEFAULT_OOM_SCENARIO_WORKLOAD,
+        description="Target workload name for the 'oom-crash' simulation scenario",
+    )
+    config_scenario_workload: str = Field(
+        default=DEFAULT_CONFIG_SCENARIO_WORKLOAD,
+        description="Target workload name for the 'config-crash' simulation scenario",
+    )
+    simulated_pod_suffix: str = Field(
+        default=DEFAULT_SIMULATED_POD_SUFFIX,
+        description="Pod suffix appended when synthesizing a pod identifier in offline simulation mode",
     )
 
     # GitHub PR Automation & GitOps
     github_token: Optional[str] = Field(default=None, description="GitHub Personal Access Token")
     github_repo: Optional[str] = Field(default=None, description="GitHub repository target: owner/repo")
-    github_base_branch: str = Field(default="main", description="Target base branch for PRs")
+    github_base_branch: str = Field(default=DEFAULT_GITHUB_BASE_BRANCH, description="Target base branch for PRs")
     dry_run_mode: bool = Field(default=True, description="When true, outputs local proposal instead of live PR")
+    project_url: str = Field(default=DEFAULT_PROJECT_URL, description="Project URL used in PR attribution footers")
 
     # Proposal output directory
-    proposals_dir: str = Field(default="output/proposals", description="Directory for saving triage PR proposals")
+    proposals_dir: str = Field(default=DEFAULT_PROPOSALS_DIR, description="Directory for saving triage PR proposals")
+
+    def scenario_workload_map(self) -> Dict[str, str]:
+        """Return mapping from simulation scenario keys to configured workload names."""
+        return {
+            OOM_SCENARIO_KEY: self.oom_scenario_workload,
+            CONFIG_SCENARIO_KEY: self.config_scenario_workload,
+        }
 
 
 settings = Settings()

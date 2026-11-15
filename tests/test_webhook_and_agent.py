@@ -215,3 +215,190 @@ def test_dashboard_uses_provider_agnostic_ui(client: TestClient):
     assert "formatIncidentEngineLabel" in html
 
 
+@pytest.mark.parametrize(
+    "scenario,live_pods,expected_pod_name,expected_deployment,expected_container,expected_reason,expected_exit_code",
+    [
+        # Happy path 1: Live cluster has crashing config-crash-app pod (fixes PR #20 404 bug)
+        (
+            "config-crash",
+            [
+                {
+                    "name": "config-crash-app-576d788f98-7hfbx",
+                    "labels": {"app": "config-crash-app"},
+                    "container_name": "api-server",
+                    "restart_count": 7,
+                    "waiting_reason": "CrashLoopBackOff",
+                    "terminated_reason": "Error",
+                    "exit_code": 1,
+                    "message": "Invalid port configuration",
+                }
+            ],
+            "config-crash-app-576d788f98-7hfbx",
+            "config-crash-app",
+            "api-server",
+            "CrashLoopBackOff",
+            1,
+        ),
+        # Happy path 2: Live cluster has crashing oom-crash-app pod
+        (
+            "oom-crash",
+            [
+                {
+                    "name": "oom-crash-app-8cbf74b46-5x5qd",
+                    "labels": {"app": "oom-crash-app"},
+                    "container_name": "worker",
+                    "restart_count": 3,
+                    "waiting_reason": "CrashLoopBackOff",
+                    "terminated_reason": "OOMKilled",
+                    "exit_code": 137,
+                    "message": "Container worker exceeded memory limit",
+                }
+            ],
+            "oom-crash-app-8cbf74b46-5x5qd",
+            "oom-crash-app",
+            "worker",
+            "OOMKilled",
+            137,
+        ),
+        # Boundary case 1: Live pod exists in cluster but container_statuses is empty (newly scheduled)
+        (
+            "config-crash",
+            [
+                {
+                    "name": "config-crash-app-9988776655-z1y2x",
+                    "labels": {"app": "config-crash-app"},
+                    "container_name": None,
+                }
+            ],
+            "config-crash-app-9988776655-z1y2x",
+            "config-crash-app",
+            "api-server",
+            "CrashLoopBackOff",
+            1,
+        ),
+        # Boundary case 2: Live cluster has only unrelated pods -> falls back to manifest + simulated_pod_suffix
+        (
+            "oom-crash",
+            [
+                {
+                    "name": "unrelated-service-1234567890-abcde",
+                    "labels": {"app": "unrelated-service"},
+                    "container_name": "web",
+                }
+            ],
+            "oom-crash-app-sim01",
+            "oom-crash-app",
+            "worker",
+            "OOMKilled",
+            137,
+        ),
+    ],
+)
+def test_resolve_simulation_alert_live_and_boundary_cases(
+    monkeypatch,
+    scenario: str,
+    live_pods,
+    expected_pod_name: str,
+    expected_deployment: str,
+    expected_container: str,
+    expected_reason: str,
+    expected_exit_code: int,
+):
+    from types import SimpleNamespace
+    from kubeheal.mcp_server import server as mcp_server
+
+    fake_items = []
+    for p in live_pods:
+        statuses = []
+        if p.get("container_name"):
+            waiting = SimpleNamespace(reason=p.get("waiting_reason"), message=p.get("message")) if p.get("waiting_reason") else None
+            terminated = (
+                SimpleNamespace(
+                    reason=p.get("terminated_reason"),
+                    exit_code=p.get("exit_code"),
+                    message=p.get("message"),
+                )
+                if p.get("terminated_reason") or p.get("exit_code") is not None
+                else None
+            )
+            statuses.append(
+                SimpleNamespace(
+                    name=p["container_name"],
+                    restart_count=p.get("restart_count", 1),
+                    state=SimpleNamespace(waiting=waiting, terminated=None),
+                    last_state=SimpleNamespace(terminated=terminated),
+                )
+            )
+        fake_items.append(
+            SimpleNamespace(
+                metadata=SimpleNamespace(
+                    name=p["name"],
+                    labels=p.get("labels", {}),
+                    owner_references=None,
+                ),
+                status=SimpleNamespace(container_statuses=statuses),
+            )
+        )
+
+    fake_core_v1 = SimpleNamespace(
+        list_namespaced_pod=lambda namespace: SimpleNamespace(items=fake_items)
+    )
+    monkeypatch.setattr(mcp_server, "_get_k8s_clients", lambda: (fake_core_v1, None))
+
+    alert = mcp_server.resolve_simulation_alert(scenario, namespace="default")
+    assert alert is not None
+    assert alert.pod_name == expected_pod_name
+    assert alert.deployment_name == expected_deployment
+    assert alert.container_name == expected_container
+    assert alert.reason == expected_reason
+    assert alert.exit_code == expected_exit_code
+
+
+@pytest.mark.parametrize(
+    "invalid_scenario",
+    [
+        "nonexistent-scenario",
+        "unknown-workload-xyz",
+        "   ",
+    ],
+)
+def test_simulate_endpoint_error_cases(client: TestClient, invalid_scenario: str):
+    response = client.post(f"/api/simulate/{invalid_scenario}")
+    assert response.status_code == 400
+    assert "Unknown scenario" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "remediation_port,small_scale_factor,unparseable_fallback,sim_suffix",
+    [
+        ("9090", 4, "256Mi", "test1"),
+        ("3000", 2, "512Mi", "pod99"),
+    ],
+)
+def test_configurable_remediation_settings_override(
+    client: TestClient,
+    monkeypatch,
+    remediation_port: str,
+    small_scale_factor: int,
+    unparseable_fallback: str,
+    sim_suffix: str,
+):
+    from kubeheal.gitops.yaml_patcher import clamp_memory_limit
+
+    monkeypatch.setattr(settings, "default_remediation_port", remediation_port)
+    monkeypatch.setattr(settings, "small_memory_scale_factor", small_scale_factor)
+    monkeypatch.setattr(settings, "unparseable_memory_fallback", unparseable_fallback)
+    monkeypatch.setattr(settings, "simulated_pod_suffix", sim_suffix)
+
+    clamped, note = clamp_memory_limit("not-a-memory-string")
+    assert clamped == unparseable_fallback
+    assert note is not None
+
+    cfg_resp = client.post("/api/simulate/config-crash")
+    assert cfg_resp.status_code == 200
+    cfg_data = cfg_resp.json()
+    assert cfg_data["alert"]["pod_name"] == f"config-crash-app-{sim_suffix}"
+    assert f'value: "{remediation_port}"' in cfg_data["yaml_diff"] or f"value: {remediation_port}" in cfg_data["yaml_diff"]
+
+
+

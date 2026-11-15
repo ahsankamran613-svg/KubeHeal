@@ -10,7 +10,21 @@ import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
-from kubeheal.config import DETERMINISTIC_ENGINE_NAME, settings
+from kubeheal.config import (
+    DEFAULT_CONFIG_CONFIDENCE,
+    DEFAULT_GENERIC_CONFIDENCE,
+    DEFAULT_IMAGE_CONFIDENCE,
+    DEFAULT_INCIDENT_ID_LENGTH,
+    DEFAULT_INVALID_PORT_PLACEHOLDER,
+    DEFAULT_KUBE_NAMESPACE,
+    DEFAULT_LLM_CONFIDENCE,
+    DEFAULT_LLM_FALLBACK_CONFIDENCE,
+    DEFAULT_OOM_CONFIDENCE,
+    DEFAULT_TRACE_PREVIEW_MAX_CHARS,
+    DETERMINISTIC_ENGINE_NAME,
+    OOM_EXIT_CODE,
+    settings,
+)
 from kubeheal.gitops.github_pr import create_remediation_proposal
 from kubeheal.gitops.yaml_patcher import (
     clamp_memory_limit,
@@ -252,7 +266,7 @@ async def execute_mcp_tool_call(name: str, args: Dict[str, Any]) -> Tuple[Dict[s
                 trace.blocked_by_guardrail = True
                 trace.status = "blocked"
                 result = {"status": "blocked", "blocked_by_guardrail": True, "command": cmd, "error": reason}
-                trace.output_preview = json.dumps(result)[:250]
+                trace.output_preview = json.dumps(result)[:DEFAULT_TRACE_PREVIEW_MAX_CHARS]
                 return result, trace
 
         # Invoke through MCPServer.call_tool()
@@ -280,27 +294,27 @@ async def execute_mcp_tool_call(name: str, args: Dict[str, Any]) -> Tuple[Dict[s
         trace.status = "error"
 
     output_str = json.dumps(result)
-    trace.output_preview = output_str[:250]
+    trace.output_preview = output_str[:DEFAULT_TRACE_PREVIEW_MAX_CHARS]
     return result, trace
 
 
 def _direct_tool_fallback(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "get_pod_status":
-        return get_pod_status(pod_name=args.get("pod_name", ""), namespace=args.get("namespace", "default"))
+        return get_pod_status(pod_name=args.get("pod_name", ""), namespace=args.get("namespace", DEFAULT_KUBE_NAMESPACE))
     if name == "get_pod_logs":
         return get_pod_logs(
             pod_name=args.get("pod_name", ""),
-            namespace=args.get("namespace", "default"),
+            namespace=args.get("namespace", DEFAULT_KUBE_NAMESPACE),
             tail_lines=int(args.get("tail_lines", settings.llm_log_tail_lines)),
             previous=bool(args.get("previous", True)),
             container_name=args.get("container_name"),
         )
     if name == "get_pod_events":
-        return get_pod_events(pod_name=args.get("pod_name", ""), namespace=args.get("namespace", "default"))
+        return get_pod_events(pod_name=args.get("pod_name", ""), namespace=args.get("namespace", DEFAULT_KUBE_NAMESPACE))
     if name == "get_deployment_spec":
         return get_deployment_spec(
             deployment_name=args.get("deployment_name", ""),
-            namespace=args.get("namespace", "default"),
+            namespace=args.get("namespace", DEFAULT_KUBE_NAMESPACE),
         )
     if name == "run_readonly_kubectl":
         return run_readonly_kubectl(command=args.get("command", ""))
@@ -355,29 +369,43 @@ async def gather_baseline_mcp_telemetry(
 
 def _compute_scaled_oom_memory(current_limit_str: Optional[str], current_req_str: Optional[str]) -> Tuple[str, str, str, str]:
     """Dynamically calculate scaled memory limit and request based on the container's actual current resources."""
-    old_limit = current_limit_str or "32Mi"
-    old_req = current_req_str or "16Mi"
+    old_limit = current_limit_str or settings.fallback_memory_limit
+    old_req = current_req_str or settings.fallback_memory_request
+
+    try:
+        fallback_limit_bytes = parse_memory_to_bytes(settings.fallback_memory_limit)
+    except Exception:
+        fallback_limit_bytes = parse_memory_to_bytes("32Mi")
 
     try:
         limit_bytes = parse_memory_to_bytes(old_limit)
     except Exception:
-        limit_bytes = 32 * 1024 * 1024
+        limit_bytes = fallback_limit_bytes
 
-    # Scale 4x for small limits (<128Mi), 2x for larger limits
-    if limit_bytes < 128 * 1024 * 1024:
-        proposed_limit_bytes = limit_bytes * 4
+    try:
+        threshold_bytes = parse_memory_to_bytes(settings.small_memory_threshold)
+    except Exception:
+        threshold_bytes = fallback_limit_bytes * 4
+
+    if limit_bytes < threshold_bytes:
+        proposed_limit_bytes = limit_bytes * settings.small_memory_scale_factor
     else:
-        proposed_limit_bytes = limit_bytes * 2
+        proposed_limit_bytes = limit_bytes * settings.large_memory_scale_factor
 
     raw_new_limit = format_bytes_to_k8s_memory(proposed_limit_bytes)
     new_limit, _ = clamp_memory_limit(raw_new_limit, current_limit_str=old_limit)
 
     try:
+        min_floor_bytes = parse_memory_to_bytes(settings.min_memory_limit)
+    except Exception:
+        min_floor_bytes = parse_memory_to_bytes(settings.fallback_memory_request)
+
+    try:
         final_limit_bytes = parse_memory_to_bytes(new_limit)
-        new_req_bytes = max(16 * 1024 * 1024, final_limit_bytes // 2)
+        new_req_bytes = max(min_floor_bytes, final_limit_bytes // 2)
         new_req = format_bytes_to_k8s_memory(new_req_bytes)
     except Exception:
-        new_req = "64Mi"
+        new_req = settings.safe_request_fallback
 
     return old_limit, new_limit, old_req, new_req
 
@@ -424,11 +452,11 @@ async def _deterministic_fallback_triage(
     modifications: List[YAMLModification] = []
 
     # Case 1: OOMKilled / exit code 137
-    if "oom" in reason_lower or alert.exit_code == 137 or "oomkilled" in combined_text:
+    if "oom" in reason_lower or alert.exit_code == OOM_EXIT_CODE or "oomkilled" in combined_text:
         old_limit, new_limit, old_req, new_req = _compute_scaled_oom_memory(curr_limit_mem, curr_req_mem)
         root_cause = (
             f"Pod '{alert.pod_name}' (container '{target_container_name or 'primary'}') was terminated by the Linux kernel "
-            f"OOM (Out Of Memory) killer with exit code 137. Container inspection via MCP shows memory limit was set to "
+            f"OOM (Out Of Memory) killer with exit code {OOM_EXIT_CODE}. Container inspection via MCP shows memory limit was set to "
             f"'{old_limit}'. Remediation scales memory limits to '{new_limit}' and requests to '{new_req}'."
         )
         modifications.append(
@@ -451,22 +479,26 @@ async def _deterministic_fallback_triage(
                 rationale=f"Align memory request ({new_req}) with updated container memory ceiling.",
             )
         )
-        return root_cause, 0.98, modifications, traces
+        return root_cause, DEFAULT_OOM_CONFIDENCE, modifications, traces
 
     # Case 2: Inspect actual env vars and logs for invalid port / environment configuration errors
     invalid_port_keys = [
         k for k, v in env_map.items()
         if "PORT" in str(k).upper() and v is not None and not str(v).isdigit()
     ]
-    if not invalid_port_keys and ("invalid_port" in combined_text or "required_port" in combined_text):
-        invalid_port_keys = ["REQUIRED_PORT"]
+    if not invalid_port_keys and (
+        DEFAULT_INVALID_PORT_PLACEHOLDER in combined_text
+        or settings.default_port_env_key.lower() in combined_text
+    ):
+        invalid_port_keys = [settings.default_port_env_key]
 
     if invalid_port_keys:
         port_key = invalid_port_keys[0]
-        old_port_val = env_map.get(port_key, "invalid_port")
+        old_port_val = env_map.get(port_key, DEFAULT_INVALID_PORT_PLACEHOLDER)
+        remediated_port = settings.default_remediation_port
         root_cause = (
             f"Pod '{alert.pod_name}' entered {alert.reason} (exit code {alert.exit_code}) due to invalid environment "
-            f"configuration `{port_key}='{old_port_val}'`. Remediation sets `{port_key}` to valid TCP port `'8080'`."
+            f"configuration `{port_key}='{old_port_val}'`. Remediation sets `{port_key}` to valid TCP port `'{remediated_port}'`."
         )
         modifications.append(
             YAMLModification(
@@ -474,29 +506,31 @@ async def _deterministic_fallback_triage(
                 container_name=target_container_name,
                 parameter_path=f"env[{port_key}]",
                 old_value=old_port_val,
-                new_value="8080",
-                rationale=f"Replace invalid non-numeric port value '{old_port_val}' in {port_key} with valid TCP port '8080'.",
+                new_value=remediated_port,
+                rationale=f"Replace invalid non-numeric port value '{old_port_val}' in {port_key} with valid TCP port '{remediated_port}'.",
             )
         )
-        if "MEMORY_LIMIT" in env_map:
-            old_env_mem = env_map["MEMORY_LIMIT"]
+        mem_env_key = settings.default_memory_env_key
+        if mem_env_key in env_map:
+            old_env_mem = env_map[mem_env_key]
             _, new_env_mem, _, _ = _compute_scaled_oom_memory(old_env_mem, None)
             modifications.append(
                 YAMLModification(
                     file_path=target_file,
                     container_name=target_container_name,
-                    parameter_path="env[MEMORY_LIMIT]",
+                    parameter_path=f"env[{mem_env_key}]",
                     old_value=old_env_mem,
                     new_value=new_env_mem,
-                    rationale=f"Increase application MEMORY_LIMIT environment threshold from {old_env_mem} to {new_env_mem}.",
+                    rationale=f"Increase application {mem_env_key} environment threshold from {old_env_mem} to {new_env_mem}.",
                 )
             )
-        return root_cause, 0.96, modifications, traces
+        return root_cause, DEFAULT_CONFIG_CONFIDENCE, modifications, traces
 
     # Case 3: ImagePullBackOff / ErrImagePull / InvalidImageName
     if reason_lower in ("imagepullbackoff", "errimagepull", "invalidimagename") or "image" in reason_lower:
         curr_img = target_c_spec.get("image", "unknown")
-        fixed_img = curr_img.split(":")[0] + ":latest" if ":" in curr_img else f"{curr_img}:latest"
+        fallback_tag = settings.default_image_tag_fallback
+        fixed_img = f"{curr_img.split(':')[0]}:{fallback_tag}" if ":" in curr_img else f"{curr_img}:{fallback_tag}"
         root_cause = (
             f"Container '{target_container_name or 'primary'}' in pod '{alert.pod_name}' failed to pull image '{curr_img}' "
             f"({alert.reason}). Message: {alert.message or 'Image tag not found or inaccessible'}."
@@ -511,7 +545,7 @@ async def _deterministic_fallback_triage(
                 rationale=f"Update unresolvable container image '{curr_img}' to valid tag '{fixed_img}'.",
             )
         )
-        return root_cause, 0.88, modifications, traces
+        return root_cause, DEFAULT_IMAGE_CONFIDENCE, modifications, traces
 
     # Case 4: Generic application crash / non-zero exit code
     old_limit, new_limit, _, _ = _compute_scaled_oom_memory(curr_limit_mem, curr_req_mem)
@@ -530,7 +564,7 @@ async def _deterministic_fallback_triage(
             rationale=f"Ensure container '{target_container_name or 'primary'}' has a safe memory ceiling ({new_limit}).",
         )
     )
-    return root_cause, 0.85, modifications, traces
+    return root_cause, DEFAULT_GENERIC_CONFIDENCE, modifications, traces
 
 
 def _parse_tool_arguments(raw_args: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -894,9 +928,9 @@ def _build_llm_triage_result(
     """Convert a validated submit_triage_solution payload into structured triage outputs."""
     root_cause = str(solution.get("root_cause_summary") or "Diagnosed by LLM agent.")
     try:
-        confidence = max(0.0, min(1.0, float(solution.get("confidence", 0.95))))
+        confidence = max(0.0, min(1.0, float(solution.get("confidence", DEFAULT_LLM_CONFIDENCE))))
     except (TypeError, ValueError):
-        confidence = 0.9
+        confidence = DEFAULT_LLM_FALLBACK_CONFIDENCE
 
     raw_mods = solution.get("modifications") or []
     modifications: List[YAMLModification] = []
@@ -1054,7 +1088,7 @@ async def _run_gemini_triage_loop(
 async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
     """End-to-end triage orchestrator: MCP pre-hydration -> LLM reasoning -> YAML patching -> PR proposal."""
     start_time = time.time()
-    incident_id = str(uuid.uuid4())[:8]
+    incident_id = str(uuid.uuid4())[:DEFAULT_INCIDENT_ID_LENGTH]
 
     dep_name = alert.deployment_name
     if not dep_name:

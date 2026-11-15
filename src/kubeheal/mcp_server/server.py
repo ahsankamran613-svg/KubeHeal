@@ -5,14 +5,27 @@ import subprocess
 from typing import Any, Dict, List, Optional
 from ruamel.yaml import YAML
 
-from kubeheal.config import settings
+from kubeheal.config import (
+    DEFAULT_CONFIG_SIM_RESTART_COUNT,
+    DEFAULT_ERROR_EXIT_CODE,
+    DEFAULT_GENERIC_SIM_RESTART_COUNT,
+    DEFAULT_KUBE_NAMESPACE,
+    DEFAULT_OOM_SIM_RESTART_COUNT,
+    DEFAULT_POD_LOG_TAIL_LINES,
+    OOM_EXIT_CODE,
+    OOM_SCENARIO_KEY,
+    settings,
+)
 from kubeheal.gitops.yaml_patcher import (
     SUPPORTED_WORKLOAD_KINDS,
     extract_containers_from_doc,
     find_manifest_for_deployment,
     infer_workload_name_from_pod,
+    parse_memory_to_bytes,
+    select_target_container,
 )
 from kubeheal.mcp_server.guardrails import validate_kubectl_command
+from kubeheal.models import AlertPayload
 
 try:
     from mcp.server import MCPServer
@@ -50,7 +63,7 @@ def _get_k8s_clients():
             _apps_v1 = client.AppsV1Api()
             _batch_v1 = client.BatchV1Api()
             # Perform a lightweight version/API check to confirm cluster is actually reachable
-            _core_v1.get_api_resources(_request_timeout=2)
+            _core_v1.get_api_resources(_request_timeout=settings.k8s_api_timeout_seconds)
             _k8s_initialized = True
         except Exception:
             _k8s_initialized = False
@@ -87,10 +100,20 @@ def _load_local_manifest_spec(name_or_pod: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _inspect_manifest_failure_hints(doc: Optional[Dict[str, Any]], pod_name: str) -> Dict[str, Any]:
+def _inspect_manifest_failure_hints(
+    doc: Optional[Dict[str, Any]],
+    pod_name: str,
+    scenario_hint: Optional[str] = None,
+) -> Dict[str, Any]:
     """Derive realistic simulation telemetry directly from the local YAML manifest spec rather than hardcoded assumptions."""
     containers_spec = extract_containers_from_doc(doc) if doc else []
-    c_spec = containers_spec[0] if containers_spec else {}
+    c_spec: Dict[str, Any] = {}
+    if containers_spec:
+        try:
+            c_spec = select_target_container(containers_spec)
+        except Exception:
+            c_spec = containers_spec[0]
+
     c_name = c_spec.get("name", "app")
     c_image = c_spec.get("image", "unknown-image")
     c_resources = {
@@ -101,35 +124,43 @@ def _inspect_manifest_failure_hints(doc: Optional[Dict[str, Any]], pod_name: str
     env_map = {e.get("name"): e.get("value") for e in env_list if isinstance(e, dict) and e.get("name")}
     cmd_str = " ".join(str(x) for x in (c_spec.get("command") or []) + (c_spec.get("args") or []))
 
-    # Detect if this manifest or pod is an OOM scenario
-    is_oom = (
-        "oom" in pod_name.lower()
-        or "bytearray(" in cmd_str
-        or (mem_limit in ("16Mi", "32Mi") and "REQUIRED_PORT" not in env_map)
-    )
-
     # Detect if this manifest has an invalid port or explicit config error in its spec
     invalid_env_keys = [
         k for k, v in env_map.items()
         if "PORT" in str(k).upper() and v is not None and not str(v).isdigit()
     ]
 
+    low_mem_limit = False
+    if mem_limit:
+        try:
+            low_mem_limit = parse_memory_to_bytes(str(mem_limit)) <= parse_memory_to_bytes(settings.fallback_memory_limit)
+        except Exception:
+            low_mem_limit = False
+
+    scenario_text = (scenario_hint or "").lower()
+    is_oom = (
+        "oom" in pod_name.lower()
+        or "oom" in scenario_text
+        or "bytearray(" in cmd_str
+        or (low_mem_limit and not invalid_env_keys)
+    )
+
     if is_oom:
-        limit_display = mem_limit or "configured"
+        limit_display = mem_limit or settings.fallback_memory_limit
         return {
             "is_oom": True,
             "container_name": c_name,
             "image": c_image,
             "resources": c_resources,
             "phase": "Running",
-            "restart_count": 4,
+            "restart_count": DEFAULT_OOM_SIM_RESTART_COUNT,
             "terminated_reason": "OOMKilled",
-            "exit_code": 137,
+            "exit_code": OOM_EXIT_CODE,
             "terminated_message": f"Container '{c_name}' exceeded {limit_display} memory cgroup limit",
             "logs": (
                 f"[{c_name}] Starting container '{c_name}' ({c_image})...\n"
                 f"[{c_name}] Memory allocation exceeded cgroup limit ({limit_display}).\n"
-                f"Killed (exit code 137 - SIGKILL: cgroup memory limit {limit_display} exceeded)"
+                f"Killed (exit code {OOM_EXIT_CODE} - SIGKILL: cgroup memory limit {limit_display} exceeded)"
             ),
             "event_reason": "OOMKilling",
             "event_message": f"Memory cgroup out of memory: Killed container '{c_name}' (limit {limit_display})",
@@ -144,9 +175,9 @@ def _inspect_manifest_failure_hints(doc: Optional[Dict[str, Any]], pod_name: str
             "image": c_image,
             "resources": c_resources,
             "phase": "CrashLoopBackOff",
-            "restart_count": 5,
+            "restart_count": DEFAULT_CONFIG_SIM_RESTART_COUNT,
             "terminated_reason": "Error",
-            "exit_code": 1,
+            "exit_code": DEFAULT_ERROR_EXIT_CODE,
             "terminated_message": f"FATAL ERROR: Invalid configuration {bad_key}='{bad_val}'",
             "logs": (
                 f"[{c_name}] Starting service ({c_image})...\n"
@@ -164,9 +195,9 @@ def _inspect_manifest_failure_hints(doc: Optional[Dict[str, Any]], pod_name: str
         "image": c_image,
         "resources": c_resources,
         "phase": "CrashLoopBackOff",
-        "restart_count": 3,
+        "restart_count": DEFAULT_GENERIC_SIM_RESTART_COUNT,
         "terminated_reason": "Error",
-        "exit_code": 1,
+        "exit_code": DEFAULT_ERROR_EXIT_CODE,
         "terminated_message": f"Container '{c_name}' exited with non-zero status (offline manifest inspection)",
         "logs": (
             f"[{c_name}] Offline simulation mode: live cluster not connected.\n"
@@ -177,8 +208,151 @@ def _inspect_manifest_failure_hints(doc: Optional[Dict[str, Any]], pod_name: str
     }
 
 
+def _find_live_pod_alert(
+    core_v1: Any,
+    deployment_name: str,
+    namespace: str,
+    hints: Dict[str, Any],
+    scenario_hint: Optional[str] = None,
+) -> Optional[AlertPayload]:
+    """Query the live Kubernetes cluster for an active/crashing pod belonging to deployment_name."""
+    try:
+        pod_list = core_v1.list_namespaced_pod(namespace=namespace)
+    except Exception:
+        return None
+
+    items = getattr(pod_list, "items", None) or []
+    matching_pods = []
+    for pod in items:
+        meta = getattr(pod, "metadata", None)
+        if not meta or not getattr(meta, "name", None):
+            continue
+        pod_name = meta.name
+        owner_refs = getattr(meta, "owner_references", None)
+        inferred = infer_workload_name_from_pod(pod_name, owner_references=owner_refs)
+        labels = getattr(meta, "labels", None) or {}
+        if inferred == deployment_name or labels.get("app") == deployment_name:
+            matching_pods.append(pod)
+
+    if not matching_pods:
+        return None
+
+    is_oom_scenario = bool(hints.get("is_oom")) or (scenario_hint or "").lower() == OOM_SCENARIO_KEY
+    default_reason = "OOMKilled" if is_oom_scenario else "CrashLoopBackOff"
+
+    for pod in matching_pods:
+        pod_name = pod.metadata.name
+        statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
+        for cs in statuses:
+            c_name = getattr(cs, "name", None) or hints["container_name"]
+            restart_count = getattr(cs, "restart_count", None)
+            if restart_count is None:
+                restart_count = hints["restart_count"]
+
+            state = getattr(cs, "state", None)
+            last_state = getattr(cs, "last_state", None)
+            waiting = getattr(state, "waiting", None) if state else None
+            terminated = (
+                getattr(state, "terminated", None) if state else None
+            ) or (getattr(last_state, "terminated", None) if last_state else None)
+
+            if waiting is not None or terminated is not None:
+                exit_code = getattr(terminated, "exit_code", None) if terminated else None
+                if exit_code is None:
+                    exit_code = hints["exit_code"]
+
+                term_reason = getattr(terminated, "reason", None) if terminated else None
+                wait_reason = getattr(waiting, "reason", None) if waiting else None
+                if term_reason == "OOMKilled" or exit_code == OOM_EXIT_CODE or is_oom_scenario:
+                    reason = "OOMKilled" if is_oom_scenario or term_reason == "OOMKilled" else (wait_reason or default_reason)
+                else:
+                    reason = wait_reason or term_reason or default_reason
+
+                message = (
+                    (getattr(terminated, "message", None) if terminated else None)
+                    or (getattr(waiting, "message", None) if waiting else None)
+                    or hints["terminated_message"]
+                )
+                return AlertPayload(
+                    pod_name=pod_name,
+                    namespace=namespace,
+                    deployment_name=deployment_name,
+                    container_name=c_name,
+                    reason=reason,
+                    exit_code=exit_code,
+                    restart_count=restart_count,
+                    message=message,
+                )
+
+    # Fallback to first matching live pod if container_statuses has not populated waiting/terminated yet
+    first_pod = matching_pods[0]
+    return AlertPayload(
+        pod_name=first_pod.metadata.name,
+        namespace=namespace,
+        deployment_name=deployment_name,
+        container_name=hints["container_name"],
+        reason=default_reason,
+        exit_code=hints["exit_code"],
+        restart_count=hints["restart_count"],
+        message=hints["terminated_message"],
+    )
+
+
+def resolve_simulation_alert(
+    scenario: str,
+    namespace: Optional[str] = None,
+) -> Optional[AlertPayload]:
+    """Dynamically build an AlertPayload from a live cluster pod (when connected) or local YAML manifest."""
+    normalized = (scenario or "").strip()
+    if not normalized:
+        return None
+
+    target_namespace = namespace or settings.kube_namespace
+    scenario_map = settings.scenario_workload_map()
+    deployment_name = scenario_map.get(normalized)
+
+    doc: Optional[Dict[str, Any]] = None
+    if deployment_name:
+        doc = _load_local_manifest_spec(deployment_name)
+    else:
+        # Allow simulating any workload that has a local manifest in manifests_dir
+        doc = _load_local_manifest_spec(normalized)
+        if doc is not None:
+            deployment_name = doc.get("metadata", {}).get("name") or infer_workload_name_from_pod(normalized)
+
+    if not deployment_name:
+        return None
+
+    fallback_pod_name = f"{deployment_name}-{settings.simulated_pod_suffix}"
+    hints = _inspect_manifest_failure_hints(doc, fallback_pod_name, scenario_hint=normalized)
+
+    core_v1, _ = _get_k8s_clients()
+    if core_v1 is not None:
+        live_alert = _find_live_pod_alert(
+            core_v1=core_v1,
+            deployment_name=deployment_name,
+            namespace=target_namespace,
+            hints=hints,
+            scenario_hint=normalized,
+        )
+        if live_alert is not None:
+            return live_alert
+
+    reason = "OOMKilled" if hints["is_oom"] else "CrashLoopBackOff"
+    return AlertPayload(
+        pod_name=fallback_pod_name,
+        namespace=target_namespace,
+        deployment_name=deployment_name,
+        container_name=hints["container_name"],
+        reason=reason,
+        exit_code=hints["exit_code"],
+        restart_count=hints["restart_count"],
+        message=hints["terminated_message"],
+    )
+
+
 @mcp.tool()
-def get_pod_status(pod_name: str, namespace: str = "default") -> Dict[str, Any]:
+def get_pod_status(pod_name: str, namespace: str = DEFAULT_KUBE_NAMESPACE) -> Dict[str, Any]:
     """Retrieve pod status, container states, restart counts, termination reasons, and resource requests/limits."""
     core_v1, _ = _get_k8s_clients()
     if not core_v1:
@@ -291,8 +465,8 @@ def get_pod_status(pod_name: str, namespace: str = "default") -> Dict[str, Any]:
 @mcp.tool()
 def get_pod_logs(
     pod_name: str,
-    namespace: str = "default",
-    tail_lines: int = 100,
+    namespace: str = DEFAULT_KUBE_NAMESPACE,
+    tail_lines: int = DEFAULT_POD_LOG_TAIL_LINES,
     previous: bool = True,
     container_name: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -348,7 +522,7 @@ def get_pod_logs(
 
 
 @mcp.tool()
-def get_pod_events(pod_name: str, namespace: str = "default") -> Dict[str, Any]:
+def get_pod_events(pod_name: str, namespace: str = DEFAULT_KUBE_NAMESPACE) -> Dict[str, Any]:
     """Fetch Warning and Normal Kubernetes events for the specified pod to diagnose scheduling or OOM events."""
     core_v1, _ = _get_k8s_clients()
     if not core_v1:
@@ -445,7 +619,7 @@ def _extract_k8s_pod_spec_containers(pod_spec: Any) -> List[Dict[str, Any]]:
 
 
 @mcp.tool()
-def get_deployment_spec(deployment_name: str, namespace: str = "default") -> Dict[str, Any]:
+def get_deployment_spec(deployment_name: str, namespace: str = DEFAULT_KUBE_NAMESPACE) -> Dict[str, Any]:
     """Retrieve container images, commands, environment variables, and resource requests/limits of a workload (Deployment, StatefulSet, DaemonSet, or Job)."""
     _, apps_v1 = _get_k8s_clients()
     if not apps_v1:
@@ -549,7 +723,7 @@ def run_readonly_kubectl(command: str) -> Dict[str, Any]:
             tokens,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=settings.kubectl_timeout_seconds,
             check=False,
         )
         return {
@@ -565,7 +739,7 @@ def run_readonly_kubectl(command: str) -> Dict[str, Any]:
             "status": "error",
             "blocked_by_guardrail": False,
             "command": command,
-            "error": "Command execution timed out after 10 seconds",
+            "error": f"Command execution timed out after {settings.kubectl_timeout_seconds} seconds",
         }
     except FileNotFoundError:
         return {

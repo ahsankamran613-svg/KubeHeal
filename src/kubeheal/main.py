@@ -8,12 +8,17 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from kubeheal.agent.triage_agent import execute_mcp_tool_call, run_triage_pipeline
-from kubeheal.config import LLMProviderConfig, settings
+from kubeheal.config import (
+    DEFAULT_MCP_TOOL_NAMES,
+    DEFAULT_RBAC_VERBS,
+    LLMProviderConfig,
+    settings,
+)
 from kubeheal.mcp_server.guardrails import validate_kubectl_command
-from kubeheal.mcp_server.server import mcp
+from kubeheal.mcp_server.server import mcp, resolve_simulation_alert
 from kubeheal.models import AlertPayload, MCPToolExecution, TriageReport
 from kubeheal.watcher.k8s_watcher import KubernetesWatcher
 
@@ -80,13 +85,7 @@ async def health_check():
         tools = await mcp.list_tools()
         mcp_tools_list = [t.name for t in tools]
     except Exception:
-        mcp_tools_list = [
-            "get_pod_status",
-            "get_pod_logs",
-            "get_pod_events",
-            "get_deployment_spec",
-            "run_readonly_kubectl",
-        ]
+        mcp_tools_list = list(DEFAULT_MCP_TOOL_NAMES)
 
     try:
         llm_cfg = settings.resolve_llm_config()
@@ -117,9 +116,11 @@ async def health_check():
         "github_configured": bool(settings.github_token and settings.github_repo),
         "mcp_tool_count": len(mcp_tools_list),
         "mcp_tools": mcp_tools_list,
+        "scenarios": settings.scenario_workload_map(),
+        "default_guardrail_probe_command": settings.default_guardrail_probe_command,
         "guardrails": {
             "mcp_read_only": "enforced",
-            "rbac_verbs": ["get", "list", "watch"],
+            "rbac_verbs": list(DEFAULT_RBAC_VERBS),
             "max_memory_cap": settings.max_memory_limit,
         },
     }
@@ -150,32 +151,12 @@ async def receive_alert(alert: AlertPayload):
 @app.post("/api/simulate/{scenario}", response_model=TriageReport)
 async def simulate_crash_scenario(scenario: str):
     """One-click simulation of real-world Kubernetes failure scenarios."""
-    if scenario == "oom-crash":
-        alert = AlertPayload(
-            pod_name="oom-crash-app-7598c9f566-x9z2k",
-            namespace=settings.kube_namespace,
-            deployment_name="oom-crash-app",
-            container_name="worker",
-            reason="OOMKilled",
-            exit_code=137,
-            restart_count=4,
-            message="Container worker exceeded 32Mi cgroup limit while allocating memory buffer (~65MB). Terminated with SIGKILL by kernel OOM killer.",
-        )
-    elif scenario == "config-crash":
-        alert = AlertPayload(
-            pod_name="config-crash-app-684cbf9b4d-j7m4q",
-            namespace=settings.kube_namespace,
-            deployment_name="config-crash-app",
-            container_name="api-server",
-            reason="CrashLoopBackOff",
-            exit_code=1,
-            restart_count=6,
-            message="FATAL ERROR: Invalid port configuration 'invalid_port': invalid literal for int() with base 10",
-        )
-    else:
+    alert = resolve_simulation_alert(scenario, namespace=settings.kube_namespace)
+    if alert is None:
+        available = ", ".join(f"'{k}'" for k in settings.scenario_workload_map())
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown scenario '{scenario}'. Available: 'oom-crash', 'config-crash'",
+            detail=f"Unknown scenario '{scenario}'. Available: {available}",
         )
 
     report = await run_triage_pipeline(alert)
@@ -184,7 +165,7 @@ async def simulate_crash_scenario(scenario: str):
 
 
 class GuardrailTestRequest(BaseModel):
-    command: str = "kubectl delete pod --all -n default"
+    command: str = Field(default_factory=lambda: settings.default_guardrail_probe_command)
 
 
 @app.post("/api/guardrail-test")

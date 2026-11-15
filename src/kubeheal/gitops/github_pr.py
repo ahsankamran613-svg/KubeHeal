@@ -5,7 +5,11 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from kubeheal.config import settings
+from kubeheal.config import (
+    DEFAULT_INCIDENT_ID_LENGTH,
+    DEFAULT_PR_TRACE_PREVIEW_MAX_CHARS,
+    settings,
+)
 from kubeheal.models import AlertPayload, MCPToolExecution, YAMLModification
 
 logger = logging.getLogger(__name__)
@@ -45,7 +49,7 @@ def generate_pr_markdown_body(
     for t in mcp_traces:
         status_badge = "🛡️ Blocked" if t.blocked_by_guardrail else ("✅ Success" if t.status == "success" else "⚠️ " + t.status)
         trace_rows.append(
-            f"| `{t.tool_name}` | `{json.dumps(t.arguments)}` | {status_badge} | {t.output_preview[:80]}... |"
+            f"| `{t.tool_name}` | `{json.dumps(t.arguments)}` | {status_badge} | {t.output_preview[:DEFAULT_PR_TRACE_PREVIEW_MAX_CHARS]}... |"
         )
     trace_table = (
         "| Tool | Arguments | Status | Preview |\n|---|---|---|---|\n" + "\n".join(trace_rows)
@@ -88,7 +92,7 @@ def generate_pr_markdown_body(
 ## 🔬 MCP Read-Only Diagnostic Traces
 {trace_table}
 
-*Generated autonomously by [KubeHeal](https://github.com/KubeHeal) using {engine_label or settings.format_llm_attribution()} and Model Context Protocol (MCP).*
+*Generated autonomously by [KubeHeal]({settings.project_url}) using {engine_label or settings.format_llm_attribution()} and Model Context Protocol (MCP).*
 """
 
 
@@ -151,7 +155,7 @@ def create_remediation_proposal(
             repo = gh.get_repo(settings.github_repo)
 
             base_branch = repo.get_branch(settings.github_base_branch)
-            branch_name = f"fix/kubeheal-{alert.deployment_name or 'workload'}-{incident_id[:8]}"
+            branch_name = f"fix/kubeheal-{alert.deployment_name or 'workload'}-{incident_id[:DEFAULT_INCIDENT_ID_LENGTH]}"
 
             # Create new branch from base branch
             repo.create_git_ref(

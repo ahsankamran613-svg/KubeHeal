@@ -679,6 +679,10 @@
           ? `${providerLabel}: ${model}`
           : `Deterministic Fallback (${providerLabel} unconfigured)`;
         if (h.guardrails && h.guardrails.max_memory_cap) currentMaxMemoryCap = h.guardrails.max_memory_cap;
+        const probeInput = document.getElementById("kubectlProbeInput");
+        if (probeInput && h.default_guardrail_probe_command && !probeInput.dataset.userEdited) {
+          probeInput.value = h.default_guardrail_probe_command;
+        }
         const container = document.getElementById("telemetryPills");
         container.innerHTML = `
           <span class="pill pill-jade">

@@ -218,7 +218,7 @@ KubeHeal gives the AI only read-only tools through its Model Context Protocol (M
 | `/api/incidents` | `GET` | Lists all investigated crashes (newest first) |
 | `/api/incidents/{incident_id}` | `GET` | Shows the full crash report, MCP tool logs, and YAML diff |
 | `/api/webhook/alert` | `POST` | Receives crash alerts from Kubernetes or Alertmanager |
-| `/api/simulate/{scenario}` | `POST` | Runs a built-in demo (`oom-crash` or `config-crash`) |
+| `/api/simulate/{scenario}` | `POST` | Runs a triage demo (`oom-crash`, `config-crash`, or workload name), resolving live pods when connected or local YAML offline |
 | `/api/guardrail-test` | `POST` | Tests whether a `kubectl` command is allowed or blocked |
 
 ---

@@ -113,14 +113,14 @@ def clamp_memory_limit(
             return clamped, f"Clamped proposed memory {mem_str} up to safety floor {clamped}"
         return mem_str, None
     except Exception:
-        # If unparseable, preserve current limit if valid, otherwise use 2x floor
+        # If unparseable, preserve current limit if valid, otherwise use configured fallback
         if current_limit_str:
             try:
                 parse_memory_to_bytes(current_limit_str)
                 return current_limit_str, f"Unparseable memory '{mem_str}', retaining existing value {current_limit_str}"
             except Exception:
                 pass
-        fallback = "128Mi"
+        fallback = settings.unparseable_memory_fallback
         return fallback, f"Unparseable memory '{mem_str}', defaulting to safe value {fallback}"
 
 
