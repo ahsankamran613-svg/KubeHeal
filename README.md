@@ -1,4 +1,4 @@
-# 🛡️ KubeHeal: Guardrailed Kubernetes AIOps Triage Agent (with MCP)
+# 🛡️ KubeHeal: Safe AI Helper for Fixing Crashing Kubernetes Pods
 
 [![CI Validation](https://github.com/ahsankamran613-svg/KubeHeal/actions/workflows/ci-validate.yml/badge.svg)](https://github.com/ahsankamran613-svg/KubeHeal/actions)
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/ahsankamran613-svg/KubeHeal)
@@ -7,89 +7,89 @@
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.0+-orange.svg)](https://modelcontextprotocol.io/)
 [![Groq](https://img.shields.io/badge/LLM-Groq%20(openai%2Fgpt--oss--120b)-purple.svg)](https://groq.com/)
 
-**KubeHeal** is an autonomous, defense-in-depth Kubernetes AIOps SRE Agent that triages failing pods (`CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`, `CreateContainerConfigError`, and non-zero exits) across Kubernetes workloads (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `ReplicaSet`, `Rollout`), performs strictly read-only diagnostics via a custom **Model Context Protocol (MCP)** server, and proposes GitOps remediations through **GitHub Pull Requests** or dry-run proposal bundles with formatted YAML diffs.
+**KubeHeal** is an AI helper for Kubernetes that watches for crashing pods (`CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`, `CreateContainerConfigError`, and non-zero exits) across Kubernetes workloads (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `ReplicaSet`, `Rollout`). It checks what went wrong using strictly **read-only** tools (via the Model Context Protocol, or MCP), and then creates a **GitHub Pull Request**—or saves a local fix preview—with the suggested YAML change for a human to review.
 
 ---
 
-## 🔒 3-Layer Defense-in-Depth Guardrail Architecture
+## 🔒 How KubeHeal Stays Safe (3 Safety Layers)
 
 ```
-                                  [ Failing Pod ]
+                                  [ Crashing Pod ]
                           (OOMKilled / CrashLoop / Err)
                                          │
                                          ▼
-                            [ Kubernetes Event Watcher ]
+                            [ Kubernetes Pod Watcher ]
                                          │
                                          ▼
-                             [ KubeHeal FastAPI Core ]
+                             [ KubeHeal Web Backend ]
                                          │
                       ┌──────────────────┴──────────────────┐
                       ▼                                     ▼
-           [ Groq LLM Orchestrator ]              [ Live Web Dashboard ]
-           (openai/gpt-oss-120b)                  - Real-time Alerts
-                      │                           - MCP Audit Traces
-                      │ MCP Tool Queries          - Unified YAML Diffs
-                      ▼                           - PR Links
+               [ Groq AI Agent ]                  [ Live Web Dashboard ]
+            (openai/gpt-oss-120b)                 - Real-time Alerts
+                      │                           - Safety Check Logs
+                      │ Read-Only Checks          - YAML Diff Preview
+                      ▼                           - Pull Request Links
           ┌───────────────────────┐
           │   Custom MCP Server   │
-          │ 🛡️ Guardrail 1: Code  │ ──► Blocks: delete, apply, exec, shell metachars, secrets
+          │ 🛡️ Layer 1: Code Rule │ ──► Blocks: delete, apply, exec, shell tricks, secrets
           └───────────┬───────────┘
                       │
                       ▼
           ┌───────────────────────┐
           │  Kubernetes Cluster   │
-          │ 🛡️ Guardrail 2: RBAC  │ ──► ServiceAccount: kubeheal-reader (get, list, watch)
+          │ 🛡️ Layer 2: K8s RBAC  │ ──► Account: kubeheal-reader (get, list, watch only)
           └───────────┬───────────┘
-                      │ Root Cause Diagnostics
+                      │ Root Cause Found
                       ▼
           ┌───────────────────────┐
-          │  GitOps Remediator    │
-          │ 🛡️ Guardrail 3: GitOps│ ──► ruamel.yaml + configurable memory bounds
+          │   YAML Fix Builder    │
+          │ 🛡️ Layer 3: GitOps PR │ ──► ruamel.yaml + safe memory limits
           └───────────┬───────────┘
                       │
            ┌──────────┴──────────┐
            ▼                     ▼
-     [ GitHub PR ]       [ Local Proposals ]
-   (Branch + Commit)   (output/proposals/*)
+     [ GitHub PR ]       [ Local Preview ]
+   (Branch + Commit)    (output/proposals/*)
 ```
 
-1. **Code-Level MCP Guardrail**: Only dedicated read-only tools and allow-listed `kubectl` verbs (`get`, `describe`, `logs`, `events`, `top`) can run. Mutating verbs (`delete`, `apply`, `patch`, `edit`, `exec`, `scale`), shell injections (`;`, `|`, `&`, `>`, `$`), sensitive resources (`secrets`, `serviceaccounts`, `roles`), privilege flags (`--token`, `--kubeconfig`, `--as`), and template extraction (`jsonpath`, `go-template`, `custom-columns`) are intercepted and rejected before execution.
-2. **Cluster-Level RBAC Guardrail**: The `kubeheal-reader` `ServiceAccount` and `ClusterRole` enforce `["get", "list", "watch"]` restrictions across core, `apps` (`deployments`, `replicasets`, `statefulsets`, `daemonsets`), and `batch` (`jobs`, `cronjobs`) resources (plus `get`/`list` on `metrics.k8s.io`) at the Kubernetes API server level.
-3. **GitOps Human-in-the-Loop**: The agent never mutates live cluster state directly. All fixes are generated as Git pull requests (or local proposal bundles) patching single- or multi-document YAML manifests via `ruamel.yaml` within configurable memory guardrails (`MIN_MEMORY_LIMIT` to `MAX_MEMORY_LIMIT`, defaulting to `16Mi`–`1Gi`), while ensuring workloads whose existing limits already meet or exceed `MAX_MEMORY_LIMIT` are never shrunk (allowing up to `2x` the current limit).
+1. **Command Safety Check (Code Level)**: The AI can only run safe, read-only tools and `kubectl` commands (`get`, `describe`, `logs`, `events`, `top`). Any command that changes things (`delete`, `apply`, `patch`, `edit`, `exec`, `scale`), uses shell tricks (`;`, `|`, `&`, `>`, `$`), tries to read secrets or roles (`secrets`, `serviceaccounts`, `roles`), uses admin flags (`--token`, `--kubeconfig`, `--as`), or dumps hidden data (`jsonpath`, `go-template`, `custom-columns`) is blocked right away.
+2. **Cluster Permission Lock (Kubernetes RBAC)**: Inside Kubernetes, the `kubeheal-reader` account only has read-only permission (`get`, `list`, `watch`) on core resources, `apps` (`deployments`, `replicasets`, `statefulsets`, `daemonsets`), and `batch` (`jobs`, `cronjobs`), plus read-only metrics (`get`, `list` on `metrics.k8s.io`). Even if something tried to change the cluster, Kubernetes itself would block it.
+3. **Human Review via Git (GitOps)**: KubeHeal never edits your running cluster directly. Every fix is written as a YAML file change (using `ruamel.yaml` so your comments stay intact) and sent as a GitHub Pull Request or saved locally for review. Memory fixes stay inside configurable safety bounds (`MIN_MEMORY_LIMIT` to `MAX_MEMORY_LIMIT`, default `16Mi`–`1Gi`), and if an app already uses more memory than `MAX_MEMORY_LIMIT`, KubeHeal will never shrink it (allowing up to `2x` its current limit).
 
 ---
 
-## ⚙️ Generalized Workload Discovery & Dynamic Triage
+## ⚙️ What KubeHeal Can Find & Fix
 
-- **Controller & Owner Resolution**: Infers parent workload names from pod `ownerReferences` (`ReplicaSet` -> `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Rollout`) as well as pod naming conventions (`<name>-<rs-hash>-<pod-hash>`, `<name>-<ordinal>`, `<name>-<5char-hash>`).
-- **Recursive & Multi-Document Manifest Discovery**: Recursively searches `MANIFESTS_DIR` (`*.yaml`/`*.yml`), parses multi-document (`---`) manifests, and matches `metadata.name` across `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `ReplicaSet`, and `Rollout`.
-- **Sidecar-Aware Container Selection**: Targets the failing `container_name` from alerts or selects the primary non-sidecar application container (automatically skipping common sidecars such as `istio-proxy`, `envoy`, `linkerd-proxy`, `fluentbit`, `datadog-agent`, and `otel-collector`).
-- **Multi-Path YAML Patching & Repo-Relative PRs**: Patches `resources.limits.memory`, `resources.requests.memory`, `resources.limits.cpu`, `resources.requests.cpu`, `env[<VAR>]` / `env.<VAR>`, `image`, `command`, `args`, and `replicas`, and resolves repository-relative GitHub paths using `REPO_ROOT_DIR`.
-- **Dynamic Deterministic Fallback**: When `GROQ_API_KEY` is unset (or unavailable), inspects MCP outputs and actual container specs to scale OOM memory dynamically (`4x` below `128Mi`, `2x` at or above `128Mi`), repair non-numeric `*PORT*` env vars, update unresolvable image tags on `ImagePullBackOff` / `ErrImagePull` / `InvalidImageName`, or apply safe baseline memory ceilings on generic crashes.
+- **Finds the parent app automatically**: Works out which workload owns a failing pod using Kubernetes `ownerReferences` or pod naming patterns—supporting `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `ReplicaSet`, and `Rollout`.
+- **Searches subfolders & multi-part YAML files**: Scans inside all subfolders of `MANIFESTS_DIR` (`*.yaml` / `*.yml`), reads files that contain multiple YAML resources (`---`), and matches the right workload by `metadata.name`.
+- **Skips sidecar helper containers**: Updates the crashing container named in the alert, or automatically picks your main app container while ignoring common sidecars (like `istio-proxy`, `envoy`, `linkerd-proxy`, `fluentbit`, `datadog-agent`, and `otel-collector`).
+- **Fixes many YAML fields & builds clean PR paths**: Can update memory/CPU `limits` and `requests`, environment variables (`env[NAME]`), container `image`, `command`, `args`, and `replicas`. Uses `REPO_ROOT_DIR` so GitHub Pull Requests point to the exact file path anywhere in your repository.
+- **Works even without an AI API key**: If `GROQ_API_KEY` is not set (or unreachable), KubeHeal checks the pod's logs, events, and YAML config itself to scale up OOM memory (`4x` when under `128Mi`, `2x` at `128Mi` or higher), fix non-numeric `*PORT*` environment values, update broken image tags (`ImagePullBackOff` / `ErrImagePull` / `InvalidImageName`), or set a safe memory limit on other crashes.
 
 ---
 
-## ☁️ One-Click Cloud Development (GitHub Codespaces)
+## ☁️ Run in the Cloud (GitHub Codespaces)
 
-Run KubeHeal directly in your browser with zero local setup:
+Try KubeHeal right in your browser with zero local setup:
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/ahsankamran613-svg/KubeHeal)
 
-The included `.devcontainer/devcontainer.json` environment pre-configures:
-- **Docker-in-Docker (DinD)** & **k3d** pre-installed to test real clusters in the cloud.
-- **Python 3.12** with all pinned requirements installed upon creation.
-- **FastAPI Dashboard** port `8000` auto-forwarded and opened in your browser.
-- **VS Code Extensions**: Python, Docker, and Kubernetes tools pre-installed.
+The included `.devcontainer/devcontainer.json` file sets everything up for you:
+- **Docker and `k3d`** already installed so you can test a real Kubernetes cluster in the cloud.
+- **Python 3.12** with all required packages installed automatically.
+- **Web Dashboard** on port `8000` forwarded and opened in your browser.
+- **VS Code Extensions** for Python, Docker, and Kubernetes pre-installed.
 
 ---
 
 ## 🚀 Quickstart
 
-### Prerequisites
-- Python 3.12+ (or use Codespaces)
-- (Optional for live cluster testing) `k3d` / Docker and `kubectl`
+### What You Need
+- Python 3.12+ (or use GitHub Codespaces)
+- *(Optional, only for testing a real cluster)* `k3d` / Docker and `kubectl`
 
-### 1. Installation
+### 1. Install
 
 **Linux / macOS:**
 ```bash
@@ -111,14 +111,14 @@ py -3.12 -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment (`.env`)
+### 2. Set Up Your `.env` Config
 Copy `.env.example` to `.env`:
 ```bash
 cp .env.example .env
 ```
-Key configuration settings:
+Main settings:
 ```ini
-# Groq AI Provider (optional: agent uses dynamic deterministic fallback when API key is unset)
+# Groq AI Provider (optional: KubeHeal uses built-in diagnostic rules if left empty)
 GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=openai/gpt-oss-120b
 
@@ -130,12 +130,12 @@ ALERT_COOLDOWN_SECONDS=300
 MANIFESTS_DIR=k8s/workloads
 REPO_ROOT_DIR=.
 
-# Remediation Guardrail Caps
+# Memory Safety Limits & Offline Simulation
 MAX_MEMORY_LIMIT=1Gi
 MIN_MEMORY_LIMIT=16Mi
 ALLOW_OFFLINE_SIMULATION=true
 
-# GitOps & GitHub PRs (leave empty for local dry-run proposals)
+# GitHub Pull Requests (leave GITHUB_TOKEN empty to save local previews only)
 GITHUB_TOKEN=
 GITHUB_REPO=owner/repo-name
 GITHUB_BASE_BRANCH=main
@@ -143,118 +143,118 @@ DRY_RUN_MODE=true
 PROPOSALS_DIR=output/proposals
 ```
 
-- `MANIFESTS_DIR` & `REPO_ROOT_DIR`: `MANIFESTS_DIR` is scanned recursively (including nested folders and multi-document YAMLs); `REPO_ROOT_DIR` resolves accurate POSIX file paths for GitHub PR updates.
-- `MIN_MEMORY_LIMIT` & `MAX_MEMORY_LIMIT`: Configurable bounds for memory remediation patches (`16Mi`–`1Gi` by default). Existing workloads already at or above `MAX_MEMORY_LIMIT` are allowed up to `2x` their current limit so large workloads are never shrunk.
-- `ALLOW_OFFLINE_SIMULATION`: When `true`, `get_pod_status`, `get_pod_logs`, and `get_pod_events` synthesize telemetry from matching local manifests if no Kubernetes cluster is reachable; when `false`, they return `status: "unavailable"`.
+- `MANIFESTS_DIR` & `REPO_ROOT_DIR`: Where your Kubernetes YAML files are stored (searched including subfolders) and your repo's root folder so GitHub PRs edit the right file path.
+- `MIN_MEMORY_LIMIT` & `MAX_MEMORY_LIMIT`: Smallest and largest memory limits KubeHeal can propose (`16Mi` to `1Gi` by default). Apps that already use more than `MAX_MEMORY_LIMIT` are never shrunk.
+- `ALLOW_OFFLINE_SIMULATION`: When `true`, `get_pod_status`, `get_pod_logs`, and `get_pod_events` create test telemetry from your local YAML files if no live cluster is connected; when `false`, they report `status: "unavailable"`.
 
-### 3. Run Automated Tests
+### 3. Run the Automated Tests
 ```powershell
 .venv\Scripts\python -m pytest -v
 ```
-*(Or on Linux/macOS: `pytest -v`)* — Runs all 21 automated tests across guardrail security, webhook/triage pipelines, workload discovery, and YAML patching.
+*(Or on Linux/macOS: `pytest -v`)* — Runs all 21 automated tests covering safety rules, crash handling, workload discovery, and YAML patching.
 
-### 4. Start KubeHeal Live Dashboard
+### 4. Start the Web Dashboard
 ```bash
 uvicorn kubeheal.main:app --reload --app-dir src --port 8000
 ```
 *(On Windows: `.venv\Scripts\python -m uvicorn kubeheal.main:app --reload --app-dir src --port 8000`)*
 
 Open [http://localhost:8000](http://localhost:8000) in your browser:
-- Click **Trigger OOMKilled Triage** to triage a simulated memory failure and generate a YAML patch.
-- Click **Trigger CrashLoopBackOff Triage** to triage an invalid port configuration crash.
-- Use the **Test Guardrail Block** probe bar to test mutating commands (e.g. `kubectl delete pod --all -n default`) and observe real-time interception.
+- Click **Trigger OOMKilled Triage** to test an out-of-memory crash and see the YAML fix.
+- Click **Trigger CrashLoopBackOff Triage** to test a bad port setting crash.
+- Type a dangerous command (like `kubectl delete pod --all -n default`) and click **Test Guardrail Block** to watch KubeHeal block it in real time.
 
 ---
 
-## ☸️ Testing with a Live `k3d` Kubernetes Cluster
+## ☸️ Testing with a Real Local Cluster (`k3d`)
 
-1. Provision the local development cluster and test workloads:
+1. Create the local test cluster and deploy two broken sample apps:
    ```powershell
    ./scripts/setup-k3d.ps1
    ```
    *(Or on Linux/macOS/Codespaces: `./scripts/setup-k3d.sh`)*
 
-2. This provisions:
-   - `kubeheal-cluster` in `k3d`
-   - `k8s/rbac/readonly-triage-rbac.yaml` (`ServiceAccount: kubeheal-reader`)
-   - Broken workload `oom-crash-app` (allocates 65MB in a 32MB limit)
-   - Broken workload `config-crash-app` (invalid port string)
+2. This sets up:
+   - A `k3d` cluster named `kubeheal-cluster`
+   - Read-only permissions from `k8s/rbac/readonly-triage-rbac.yaml` (`ServiceAccount: kubeheal-reader`)
+   - Broken sample app `oom-crash-app` (tries to use 65MB inside a 32MB limit)
+   - Broken sample app `config-crash-app` (has an invalid port setting)
 
-3. Enable the background watcher in `.env`:
+3. Turn on live watching in `.env`:
    ```ini
    ENABLE_K8S_WATCHER=true
    ```
 
-4. Restart KubeHeal to watch live crashes get automatically triaged:
+4. Restart KubeHeal so it watches the cluster and fixes crashes automatically:
    ```bash
    uvicorn kubeheal.main:app --reload --app-dir src --port 8000
    ```
 
 ---
 
-## 🧰 Read-Only MCP Tools
+## 🧰 Read-Only Tools Used by the AI (MCP)
 
-KubeHeal exposes strictly read-only diagnostics via its internal Model Context Protocol (MCP) server:
+KubeHeal gives the AI only read-only tools through its Model Context Protocol (MCP) server:
 
-| MCP Tool | Description | Guardrail Verification |
+| MCP Tool | What It Does | Safety Check |
 |---|---|---|
-| `get_pod_status` | Retrieves pod phase, container states, restart counts, exit codes, and resource limits (with manifest-backed simulation when offline and `ALLOW_OFFLINE_SIMULATION=true`) | Read-only API call |
-| `get_pod_logs` | Tails crashing/crashed container logs with `previous=True` and optional `container_name` targeting | Read-only API call |
-| `get_pod_events` | Fetches Warning/Normal events from Kubernetes event buffer | Read-only API call |
-| `get_deployment_spec` | Reads workload spec, images, commands/args, env vars (`valueFrom` masked), and resource constraints for `Deployment`, `StatefulSet`, and `DaemonSet` (or any supported local workload manifest) | Read-only API call |
-| `run_readonly_kubectl` | Runs raw diagnostics (`get`, `describe`, `logs`, `events`, `top`) | Blocks mutating verbs, shell metachars, sensitive resources, privilege flags, & output templates |
+| `get_pod_status` | Checks pod phase, container state, restart count, exit code, and memory/CPU limits (uses local YAML simulation if offline and `ALLOW_OFFLINE_SIMULATION=true`) | Read-only check |
+| `get_pod_logs` | Reads logs from crashing containers (supports `previous=True` and `container_name` for multi-container pods) | Read-only check |
+| `get_pod_events` | Reads Warning and Normal events for the pod | Read-only check |
+| `get_deployment_spec` | Reads images, commands, args, env vars (hiding secret/configmap `valueFrom` refs), and resource limits for `Deployment`, `StatefulSet`, and `DaemonSet` (or any supported local YAML file) | Read-only check |
+| `run_readonly_kubectl` | Runs safe `kubectl` checks (`get`, `describe`, `logs`, `events`, `top`) | Blocks write verbs, shell tricks, secrets/roles, admin flags, & template dumps |
 
 ---
 
-## 🌐 API Reference
+## 🌐 Web & API Endpoints
 
-| Endpoint | Method | Description |
+| Endpoint | Method | What It Does |
 |---|---|---|
-| `/` | `GET` | Live AIOps Triage Web Dashboard |
-| `/api/health` | `GET` | Cluster connectivity, MCP tool discovery, active model, and guardrail status (`max_memory_cap`, etc.) |
-| `/api/incidents` | `GET` | List all triaged incidents ordered chronologically |
-| `/api/incidents/{incident_id}` | `GET` | Retrieve full incident report, MCP audit traces, and YAML diff |
-| `/api/webhook/alert` | `POST` | Webhook ingestion endpoint for Kubernetes/Alertmanager alerts |
-| `/api/simulate/{scenario}` | `POST` | One-click simulation of `oom-crash` or `config-crash` |
-| `/api/guardrail-test` | `POST` | Test MCP guardrail against mutating verbs and shell injections |
+| `/` | `GET` | Opens the Live Web Dashboard |
+| `/api/health` | `GET` | Shows cluster connection, MCP tools, active AI model, and guardrail settings |
+| `/api/incidents` | `GET` | Lists all investigated crashes (newest first) |
+| `/api/incidents/{incident_id}` | `GET` | Shows the full crash report, MCP tool logs, and YAML diff |
+| `/api/webhook/alert` | `POST` | Receives crash alerts from Kubernetes or Alertmanager |
+| `/api/simulate/{scenario}` | `POST` | Runs a built-in demo (`oom-crash` or `config-crash`) |
+| `/api/guardrail-test` | `POST` | Tests whether a `kubectl` command is allowed or blocked |
 
 ---
 
-## 📁 Repository Structure
+## 📁 Project Files
 
 ```
 KubeHeal/
 ├── .devcontainer/
-│   └── devcontainer.json      # Codespaces environment with DinD, k3d, & Python 3.12
+│   └── devcontainer.json      # GitHub Codespaces setup (Docker, k3d, Python 3.12)
 ├── .github/workflows/
-│   └── ci-validate.yml        # CI test pipeline (Python 3.12)
+│   └── ci-validate.yml        # GitHub Actions CI test runner (Python 3.12)
 ├── k8s/
 │   ├── rbac/
-│   │   └── readonly-triage-rbac.yaml # ServiceAccount + ClusterRole (core, apps, batch, metrics)
+│   │   └── readonly-triage-rbac.yaml # Read-only cluster permissions (core, apps, batch, metrics)
 │   ├── workloads/
-│   │   ├── oom-crash-app.yaml        # Demo broken OOM workload (32Mi limit)
-│   │   └── config-crash-app.yaml     # Demo broken config workload (invalid port)
+│   │   ├── oom-crash-app.yaml        # Sample broken OOM app (32Mi limit)
+│   │   └── config-crash-app.yaml     # Sample broken config app (bad port)
 │   └── agent/
-│       └── agent-deployment.yaml     # In-cluster deployment manifest
-├── output/proposals/          # Local GitOps proposal bundles
+│       └── agent-deployment.yaml     # YAML to run KubeHeal inside a cluster
+├── output/proposals/          # Saved local fix previews and diffs
 ├── scripts/
-│   ├── setup-k3d.ps1          # PowerShell k3d cluster setup
-│   └── setup-k3d.sh           # Bash k3d cluster setup
+│   ├── setup-k3d.ps1          # Windows cluster setup script
+│   └── setup-k3d.sh           # Linux/macOS cluster setup script
 ├── src/kubeheal/
-│   ├── agent/                 # Groq LLM orchestrator & dynamic triage pipeline
-│   ├── gitops/                # Multi-kind ruamel.yaml patcher & PyGithub PR service
-│   ├── mcp_server/            # Read-only FastMCP / MCPServer & guardrails
-│   ├── watcher/               # K8s polling watcher (ownerRefs + cooldown deduplication)
-│   ├── static/index.html      # Live AIOps Triage Web Dashboard
-│   ├── config.py              # pydantic-settings configuration
-│   ├── models.py              # Pydantic v2 data models
-│   └── main.py                # FastAPI web service & webhook endpoints
-├── tests/                     # 21 automated pytest tests across 3 suites
-│   ├── test_guardrails.py     # MCP security & verb whitelist tests
-│   ├── test_webhook_and_agent.py # FastAPI, dynamic triage, and simulated runs
-│   └── test_yaml_patcher.py   # Multi-kind YAML patching, discovery, & guardrail tests
-├── .env.example               # Environment configuration template
-├── Dockerfile                 # Container image with kubectl
-├── requirements.txt           # Pinned dependencies
-└── pyproject.toml             # Project metadata & pytest config
+│   ├── agent/                 # AI & fallback crash investigation logic
+│   ├── gitops/                # Safe YAML editor & GitHub Pull Request creator
+│   ├── mcp_server/            # Read-only MCP tools & command safety rules
+│   ├── watcher/               # Background Kubernetes pod crash watcher
+│   ├── static/index.html      # Live Web Dashboard UI
+│   ├── config.py              # App settings loader (.env)
+│   ├── models.py              # Data models (alerts, traces, reports)
+│   └── main.py                # FastAPI server & API endpoints
+├── tests/                     # 21 automated tests across 3 files
+│   ├── test_guardrails.py     # Command blocking & safety tests
+│   ├── test_webhook_and_agent.py # API, crash handling, and demo tests
+│   └── test_yaml_patcher.py   # YAML editing, file discovery, & memory limit tests
+├── .env.example               # Example environment settings file
+├── Dockerfile                 # Docker image with kubectl installed
+├── requirements.txt           # Python dependencies
+└── pyproject.toml             # Project settings & pytest config
 ```
