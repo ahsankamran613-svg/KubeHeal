@@ -30,6 +30,7 @@ def generate_pr_markdown_body(
     modifications: List[YAMLModification],
     diff_content: str,
     mcp_traces: List[MCPToolExecution],
+    engine_label: Optional[str] = None,
 ) -> str:
     """Generate structured markdown body for the GitHub PR or local proposal."""
     mod_lines = []
@@ -87,7 +88,7 @@ def generate_pr_markdown_body(
 ## 🔬 MCP Read-Only Diagnostic Traces
 {trace_table}
 
-*Generated autonomously by [KubeHeal](https://github.com/KubeHeal) using Groq ({settings.groq_model}) and Model Context Protocol (MCP).*
+*Generated autonomously by [KubeHeal](https://github.com/KubeHeal) using {engine_label or settings.format_llm_attribution()} and Model Context Protocol (MCP).*
 """
 
 
@@ -100,6 +101,7 @@ def create_remediation_proposal(
     patched_content: str,
     diff_content: str,
     mcp_traces: List[MCPToolExecution],
+    engine_label: Optional[str] = None,
 ) -> Tuple[Optional[str], str]:
     """Create a local proposal bundle on disk, and optionally open a GitHub Pull Request.
 
@@ -128,6 +130,7 @@ def create_remediation_proposal(
         modifications=modifications,
         diff_content=diff_content,
         mcp_traces=mcp_traces,
+        engine_label=engine_label,
     )
     proposal_md = base_dir / "PROPOSAL.md"
     with open(proposal_md, "w", encoding="utf-8") as f:

@@ -5,7 +5,7 @@
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com/)
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.0+-orange.svg)](https://modelcontextprotocol.io/)
-[![Groq](https://img.shields.io/badge/LLM-Groq%20(openai%2Fgpt--oss--120b)-purple.svg)](https://groq.com/)
+[![LLM](https://img.shields.io/badge/LLM-Gemini%203.5%20Flash--Lite%20%7C%20Groq-purple.svg)](https://ai.google.dev/)
 
 **KubeHeal** is an AI helper for Kubernetes that watches for crashing pods (`CrashLoopBackOff`, `OOMKilled`, `ImagePullBackOff`, `CreateContainerConfigError`, and non-zero exits) across Kubernetes workloads (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `ReplicaSet`, `Rollout`). It checks what went wrong using strictly **read-only** tools (via the Model Context Protocol, or MCP), and then creates a **GitHub Pull Request**—or saves a local fix preview—with the suggested YAML change for a human to review.
 
@@ -25,8 +25,8 @@
                                          │
                       ┌──────────────────┴──────────────────┐
                       ▼                                     ▼
-               [ Groq AI Agent ]                  [ Live Web Dashboard ]
-            (openai/gpt-oss-120b)                 - Real-time Alerts
+               [ AI Triage Agent ]                [ Live Web Dashboard ]
+           (Gemini 3.5 Flash-Lite / Groq)         - Real-time Alerts
                       │                           - Safety Check Logs
                       │ Read-Only Checks          - YAML Diff Preview
                       ▼                           - Pull Request Links
@@ -65,7 +65,7 @@
 - **Searches subfolders & multi-part YAML files**: Scans inside all subfolders of `MANIFESTS_DIR` (`*.yaml` / `*.yml`), reads files that contain multiple YAML resources (`---`), and matches the right workload by `metadata.name`.
 - **Skips sidecar helper containers**: Updates the crashing container named in the alert, or automatically picks your main app container while ignoring common sidecars (like `istio-proxy`, `envoy`, `linkerd-proxy`, `fluentbit`, `datadog-agent`, and `otel-collector`).
 - **Fixes many YAML fields & builds clean PR paths**: Can update memory/CPU `limits` and `requests`, environment variables (`env[NAME]`), container `image`, `command`, `args`, and `replicas`. Uses `REPO_ROOT_DIR` so GitHub Pull Requests point to the exact file path anywhere in your repository.
-- **Works even without an AI API key**: If `GROQ_API_KEY` is not set (or unreachable), KubeHeal checks the pod's logs, events, and YAML config itself to scale up OOM memory (`4x` when under `128Mi`, `2x` at `128Mi` or higher), fix non-numeric `*PORT*` environment values, update broken image tags (`ImagePullBackOff` / `ErrImagePull` / `InvalidImageName`), or set a safe memory limit on other crashes.
+- **Works even without an AI API key**: If `GEMINI_API_KEY` and `GROQ_API_KEY` are not set (or unreachable), KubeHeal checks the pod's logs, events, and YAML config itself to scale up OOM memory (`4x` when under `128Mi`, `2x` at `128Mi` or higher), fix non-numeric `*PORT*` environment values, update broken image tags (`ImagePullBackOff` / `ErrImagePull` / `InvalidImageName`), or set a safe memory limit on other crashes.
 
 ---
 
@@ -118,8 +118,11 @@ cp .env.example .env
 ```
 Main settings:
 ```ini
-# Groq AI Provider (optional: KubeHeal uses built-in diagnostic rules if left empty)
-GROQ_API_KEY=your_groq_api_key_here
+# AI Provider ('auto', 'gemini', or 'groq'; optional: KubeHeal uses built-in diagnostic rules if keys are empty)
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-3.5-flash-lite
+GROQ_API_KEY=
 GROQ_MODEL=openai/gpt-oss-120b
 
 # Kubernetes Settings
@@ -151,7 +154,7 @@ PROPOSALS_DIR=output/proposals
 ```powershell
 .venv\Scripts\python -m pytest -v
 ```
-*(Or on Linux/macOS: `pytest -v`)* — Runs all 21 automated tests covering safety rules, crash handling, workload discovery, and YAML patching.
+*(Or on Linux/macOS: `pytest -v`)* — Runs the automated test suite covering safety guardrails, MCP pre-hydration, Gemini/Groq provider switching, crash handling, workload discovery, and YAML patching.
 
 ### 4. Start the Web Dashboard
 ```bash
@@ -249,7 +252,8 @@ KubeHeal/
 │   ├── config.py              # App settings loader (.env)
 │   ├── models.py              # Data models (alerts, traces, reports)
 │   └── main.py                # FastAPI server & API endpoints
-├── tests/                     # 21 automated tests across 3 files
+├── tests/                     # Automated test suite across 4 files
+│   ├── test_agent_prehydration.py # Pre-hydration, Gemini/Groq provider switching, & fallback tests
 │   ├── test_guardrails.py     # Command blocking & safety tests
 │   ├── test_webhook_and_agent.py # API, crash handling, and demo tests
 │   └── test_yaml_patcher.py   # YAML editing, file discovery, & memory limit tests

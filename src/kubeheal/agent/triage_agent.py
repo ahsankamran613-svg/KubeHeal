@@ -1,14 +1,16 @@
-"""AI Triage Agent orchestrating Groq LLM (openai/gpt-oss-120b) and MCP read-only tools."""
+"""AI Triage Agent orchestrating MCP telemetry pre-hydration, LLM diagnostics, and GitOps remediation."""
 
+import asyncio
+from dataclasses import dataclass
 import json
 import logging
-import re
 import time
 import uuid
+import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
-from kubeheal.config import settings
+from kubeheal.config import DETERMINISTIC_ENGINE_NAME, settings
 from kubeheal.gitops.github_pr import create_remediation_proposal
 from kubeheal.gitops.yaml_patcher import (
     clamp_memory_limit,
@@ -32,70 +34,203 @@ from kubeheal.models import AlertPayload, MCPToolExecution, TriageReport, YAMLMo
 
 logger = logging.getLogger(__name__)
 
-SUBMIT_SOLUTION_TOOL_SCHEMA: Dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "submit_triage_solution",
-        "description": "Conclude the investigation, supply the root cause diagnosis, confidence score, and proposed YAML manifest modifications.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "root_cause_summary": {
-                    "type": "string",
-                    "description": "Clear explanation of why the pod crashed and how the fix resolves it.",
-                },
-                "confidence": {
-                    "type": "number",
-                    "description": "Confidence score between 0.0 and 1.0",
-                },
-                "modifications": {
-                    "type": "array",
-                    "description": "List of targeted YAML adjustments to apply to the manifest",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "container_name": {
-                                "type": "string",
-                                "description": "Name of the target container to modify (optional if single container)",
-                            },
-                            "parameter_path": {
-                                "type": "string",
-                                "description": "Target YAML path, e.g. 'resources.limits.memory', 'resources.requests.memory', 'image', 'command', 'args', or 'env[<VAR_NAME>]'",
-                            },
-                            "old_value": {"type": "string", "description": "Existing value"},
-                            "new_value": {"type": "string", "description": "Recommended new value"},
-                            "rationale": {"type": "string", "description": "Reason for changing this parameter"},
+# Event-loop-scoped semaphores so concurrent crashes queue instead of bursting TPM limits.
+_llm_semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Tuple[int, asyncio.Semaphore]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+MILLISECONDS_PER_SECOND = 1000
+MIN_HTTP_ATTEMPTS = 1
+DEFAULT_TOOL_PARAMETERS_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {}}
+
+SUBMIT_SOLUTION_TOOL_SPEC: Dict[str, Any] = {
+    "name": "submit_triage_solution",
+    "description": "Conclude the investigation, supply the root cause diagnosis, confidence score, and proposed YAML manifest modifications.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "root_cause_summary": {
+                "type": "string",
+                "description": "Clear explanation of why the pod crashed and how the fix resolves it.",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence score between 0.0 and 1.0",
+            },
+            "modifications": {
+                "type": "array",
+                "description": "List of targeted YAML adjustments to apply to the manifest",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "container_name": {
+                            "type": "string",
+                            "description": "Name of the target container to modify (optional if single container)",
                         },
-                        "required": ["parameter_path", "new_value", "rationale"],
+                        "parameter_path": {
+                            "type": "string",
+                            "description": "Target YAML path, e.g. 'resources.limits.memory', 'resources.requests.memory', 'image', 'command', 'args', or 'env[<VAR_NAME>]'",
+                        },
+                        "old_value": {"type": "string", "description": "Existing value"},
+                        "new_value": {"type": "string", "description": "Recommended new value"},
+                        "rationale": {"type": "string", "description": "Reason for changing this parameter"},
                     },
+                    "required": ["parameter_path", "new_value", "rationale"],
                 },
             },
-            "required": ["root_cause_summary", "confidence", "modifications"],
         },
+        "required": ["root_cause_summary", "confidence", "modifications"],
     },
 }
 
+SUBMIT_SOLUTION_TOOL_SCHEMA: Dict[str, Any] = {
+    "type": "function",
+    "function": SUBMIT_SOLUTION_TOOL_SPEC,
+}
 
-async def discover_mcp_tools_for_groq() -> List[Dict[str, Any]]:
-    """Dynamically discover tools registered on the MCPServer and convert them to Groq/OpenAI tool-calling schema."""
-    groq_tools: List[Dict[str, Any]] = []
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    """Return an event-loop-scoped semaphore matching settings.llm_concurrency_limit."""
+    loop = asyncio.get_running_loop()
+    limit = max(1, int(settings.llm_concurrency_limit))
+    cached = _llm_semaphores.get(loop)
+    if cached is not None and cached[0] == limit:
+        return cached[1]
+    semaphore = asyncio.Semaphore(limit)
+    _llm_semaphores[loop] = (limit, semaphore)
+    return semaphore
+
+
+def compact_log_text(logs_text: str, max_chars: int, max_consecutive_repeats: int = 3) -> str:
+    """Collapse repeated consecutive log lines and retain head + tail within max_chars."""
+    if not logs_text or max_chars <= 0:
+        return ""
+
+    lines = logs_text.splitlines()
+    collapsed_lines: List[str] = []
+    prev_line: Optional[str] = None
+    repeat_count = 0
+
+    for line in lines:
+        if line == prev_line:
+            repeat_count += 1
+            if repeat_count <= max_consecutive_repeats:
+                collapsed_lines.append(line)
+        else:
+            if repeat_count > max_consecutive_repeats:
+                omitted = repeat_count - max_consecutive_repeats
+                collapsed_lines.append(f"... [previous line repeated {omitted} more time(s)]")
+            collapsed_lines.append(line)
+            prev_line = line
+            repeat_count = 1
+
+    if repeat_count > max_consecutive_repeats:
+        omitted = repeat_count - max_consecutive_repeats
+        collapsed_lines.append(f"... [previous line repeated {omitted} more time(s)]")
+
+    collapsed = "\n".join(collapsed_lines)
+    if len(collapsed) <= max_chars:
+        return collapsed
+
+    marker = (
+        "\n... [middle log lines truncated; use get_pod_logs or run_readonly_kubectl "
+        "if earlier context is needed] ...\n"
+    )
+    if max_chars <= len(marker) + 20:
+        return collapsed[-max_chars:]
+
+    available = max_chars - len(marker)
+    head_budget = max(1, int(available * 0.25))
+    tail_budget = max(1, available - head_budget)
+    return f"{collapsed[:head_budget]}{marker}{collapsed[-tail_budget:]}"
+
+
+def compact_telemetry_for_llm(
+    baseline_context: Dict[str, Any],
+    max_log_chars: int,
+) -> Dict[str, Any]:
+    """Create a token-efficient copy of baseline MCP telemetry without losing diagnostic signal."""
+    raw_status = baseline_context.get("pod_status") or {}
+    raw_events = baseline_context.get("pod_events") or {}
+    raw_logs = baseline_context.get("pod_logs") or {}
+    raw_spec = baseline_context.get("workload_spec") or {}
+
+    compact_logs_text = compact_log_text(str(raw_logs.get("logs", "")), max_chars=max_log_chars)
+
+    raw_event_list = raw_events.get("events") or []
+    compact_events = [
+        {
+            k: ev.get(k)
+            for k in ("type", "reason", "message", "count", "last_timestamp")
+            if ev.get(k) is not None
+        }
+        for ev in raw_event_list
+        if isinstance(ev, dict)
+    ]
+
+    return {
+        "pod_status": {
+            k: raw_status.get(k)
+            for k in ("status", "source", "phase", "container_statuses", "message")
+            if raw_status.get(k) is not None
+        },
+        "pod_events": {
+            "status": raw_events.get("status"),
+            "events": compact_events,
+            **({"message": raw_events["message"]} if raw_events.get("message") else {}),
+        },
+        "pod_logs": {
+            "status": raw_logs.get("status"),
+            "logs": compact_logs_text,
+            **({"message": raw_logs["message"]} if raw_logs.get("message") else {}),
+        },
+        "workload_spec": {
+            k: raw_spec.get(k)
+            for k in ("status", "source", "kind", "deployment_name", "replicas", "containers", "message")
+            if raw_spec.get(k) is not None
+        },
+    }
+
+
+async def _discover_mcp_tool_specs() -> List[Dict[str, Any]]:
+    """Discover registered MCP tools in a provider-neutral specification format."""
+    specs: List[Dict[str, Any]] = []
     try:
         mcp_tools = await mcp.list_tools()
         for tool in mcp_tools:
-            schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", {})
-            groq_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": (tool.description or "").strip(),
-                    "parameters": schema,
-                },
+            schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None)
+            specs.append({
+                "name": tool.name,
+                "description": (tool.description or "").strip(),
+                "parameters": schema or DEFAULT_TOOL_PARAMETERS_SCHEMA,
             })
     except Exception as e:
         logger.warning(f"Dynamic MCP tool discovery fallback triggered: {e}")
 
-    groq_tools.append(SUBMIT_SOLUTION_TOOL_SCHEMA)
-    return groq_tools
+    specs.append(SUBMIT_SOLUTION_TOOL_SPEC)
+    return specs
+
+
+async def discover_mcp_tools_for_groq() -> List[Dict[str, Any]]:
+    """Dynamically discover tools registered on the MCPServer and convert them to Groq/OpenAI tool-calling schema."""
+    specs = await _discover_mcp_tool_specs()
+    return [{"type": "function", "function": spec} for spec in specs]
+
+
+async def discover_mcp_tools_for_gemini() -> List[Any]:
+    """Dynamically discover tools registered on the MCPServer and convert them to Google GenAI Tool declarations."""
+    from google.genai import types
+
+    specs = await _discover_mcp_tool_specs()
+    declarations = [
+        types.FunctionDeclaration(
+            name=spec["name"],
+            description=spec["description"],
+            parameters_json_schema=spec["parameters"],
+        )
+        for spec in specs
+    ]
+    return [types.Tool(function_declarations=declarations)]
 
 
 async def execute_mcp_tool_call(name: str, args: Dict[str, Any]) -> Tuple[Dict[str, Any], MCPToolExecution]:
@@ -156,7 +291,7 @@ def _direct_tool_fallback(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return get_pod_logs(
             pod_name=args.get("pod_name", ""),
             namespace=args.get("namespace", "default"),
-            tail_lines=int(args.get("tail_lines", 100)),
+            tail_lines=int(args.get("tail_lines", settings.llm_log_tail_lines)),
             previous=bool(args.get("previous", True)),
             container_name=args.get("container_name"),
         )
@@ -170,6 +305,52 @@ def _direct_tool_fallback(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "run_readonly_kubectl":
         return run_readonly_kubectl(command=args.get("command", ""))
     return {"error": f"Unknown tool: {name}"}
+
+
+async def gather_baseline_mcp_telemetry(
+    alert: AlertPayload,
+    dep_name: str,
+    tail_lines: Optional[int] = None,
+) -> Tuple[Dict[str, Any], List[MCPToolExecution]]:
+    """Pre-hydrate the 4 universal read-only MCP diagnostics through the audited MCP protocol."""
+    traces: List[MCPToolExecution] = []
+
+    status_res, trace_status = await execute_mcp_tool_call(
+        "get_pod_status",
+        {"pod_name": alert.pod_name, "namespace": alert.namespace},
+    )
+    traces.append(trace_status)
+
+    events_res, trace_events = await execute_mcp_tool_call(
+        "get_pod_events",
+        {"pod_name": alert.pod_name, "namespace": alert.namespace},
+    )
+    traces.append(trace_events)
+
+    log_args: Dict[str, Any] = {
+        "pod_name": alert.pod_name,
+        "namespace": alert.namespace,
+        "tail_lines": tail_lines if tail_lines is not None else settings.llm_log_tail_lines,
+        "previous": True,
+    }
+    if alert.container_name:
+        log_args["container_name"] = alert.container_name
+    logs_res, trace_logs = await execute_mcp_tool_call("get_pod_logs", log_args)
+    traces.append(trace_logs)
+
+    spec_res, trace_spec = await execute_mcp_tool_call(
+        "get_deployment_spec",
+        {"deployment_name": dep_name, "namespace": alert.namespace},
+    )
+    traces.append(trace_spec)
+
+    baseline_context = {
+        "pod_status": status_res,
+        "pod_events": events_res,
+        "pod_logs": logs_res,
+        "workload_spec": spec_res,
+    }
+    return baseline_context, traces
 
 
 def _compute_scaled_oom_memory(current_limit_str: Optional[str], current_req_str: Optional[str]) -> Tuple[str, str, str, str]:
@@ -204,34 +385,18 @@ def _compute_scaled_oom_memory(current_limit_str: Optional[str], current_req_str
 async def _deterministic_fallback_triage(
     alert: AlertPayload,
     manifest_path: Optional[Path],
+    baseline_context: Optional[Dict[str, Any]] = None,
+    baseline_traces: Optional[List[MCPToolExecution]] = None,
 ) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution]]:
-    """Intelligent deterministic diagnostic engine that inspects actual MCP tool outputs and container specs."""
-    traces: List[MCPToolExecution] = []
-
-    status_res, trace_status = await execute_mcp_tool_call(
-        "get_pod_status",
-        {"pod_name": alert.pod_name, "namespace": alert.namespace},
-    )
-    traces.append(trace_status)
-
-    events_res, trace_events = await execute_mcp_tool_call(
-        "get_pod_events",
-        {"pod_name": alert.pod_name, "namespace": alert.namespace},
-    )
-    traces.append(trace_events)
-
-    log_args: Dict[str, Any] = {"pod_name": alert.pod_name, "namespace": alert.namespace, "previous": True}
-    if alert.container_name:
-        log_args["container_name"] = alert.container_name
-    logs_res, trace_logs = await execute_mcp_tool_call("get_pod_logs", log_args)
-    traces.append(trace_logs)
-
+    """Intelligent deterministic diagnostic engine that inspects MCP telemetry and container specs."""
     dep_name = alert.deployment_name or infer_workload_name_from_pod(alert.pod_name)
-    spec_res, trace_spec = await execute_mcp_tool_call(
-        "get_deployment_spec",
-        {"deployment_name": dep_name, "namespace": alert.namespace},
-    )
-    traces.append(trace_spec)
+    if baseline_context is None or baseline_traces is None:
+        baseline_context, traces = await gather_baseline_mcp_telemetry(alert, dep_name)
+    else:
+        traces = list(baseline_traces)
+
+    logs_res = baseline_context.get("pod_logs") or {}
+    spec_res = baseline_context.get("workload_spec") or {}
 
     # Extract actual container spec from MCP get_deployment_spec response
     spec_containers = spec_res.get("containers", []) if isinstance(spec_res, dict) else []
@@ -251,7 +416,7 @@ async def _deterministic_fallback_triage(
     env_list = target_c_spec.get("env") or []
     env_map = {e.get("name"): e.get("value") for e in env_list if isinstance(e, dict) and e.get("name")}
 
-    logs_text = str((logs_res or {}).get("logs", ""))
+    logs_text = str(logs_res.get("logs", ""))
     reason_lower = alert.reason.lower()
     msg_lower = (alert.message or "").lower()
     combined_text = f"{reason_lower} {msg_lower} {logs_text.lower()}"
@@ -368,18 +533,303 @@ async def _deterministic_fallback_triage(
     return root_cause, 0.85, modifications, traces
 
 
-async def _run_groq_triage_loop(
+def _parse_tool_arguments(raw_args: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Safely parse tool call arguments (JSON string or dict) returned by an LLM."""
+    if isinstance(raw_args, dict):
+        return raw_args, None
+    if raw_args is None or raw_args == "":
+        return {}, None
+    if not isinstance(raw_args, str):
+        return None, f"Tool arguments must be a JSON object or string, got {type(raw_args).__name__}"
+    try:
+        parsed = json.loads(raw_args)
+    except json.JSONDecodeError as e:
+        return None, f"Invalid JSON tool arguments: {e}"
+    if not isinstance(parsed, dict):
+        return None, "Tool arguments must decode to a JSON object"
+    return parsed, None
+
+
+def _serialize_assistant_message(msg: Any) -> Dict[str, Any]:
+    """Convert a Groq/OpenAI ChatCompletionMessage (or test fake) into a message dict."""
+    if hasattr(msg, "model_dump") and callable(msg.model_dump):
+        return msg.model_dump(exclude_none=True)
+
+    serialized: Dict[str, Any] = {"role": "assistant"}
+    content = getattr(msg, "content", None)
+    if content is not None:
+        serialized["content"] = content
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls:
+        serialized["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": getattr(tc, "type", "function"),
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments or "{}",
+                },
+            }
+            for tc in tool_calls
+        ]
+    return serialized
+
+
+async def _close_client_safely(client: Any) -> None:
+    """Safely close an async or sync LLM client if it exposes aclose or close."""
+    if client is None:
+        return
+    for method_name in ("aclose", "close"):
+        close_fn = getattr(client, method_name, None)
+        if callable(close_fn):
+            res = close_fn()
+            if asyncio.iscoroutine(res):
+                await res
+            return
+
+
+@dataclass
+class NormalizedToolCall:
+    """Provider-neutral representation of a single LLM tool invocation."""
+
+    id: Optional[str]
+    name: str
+    arguments: Any
+
+
+class LLMProviderSession(Protocol):
+    """Protocol implemented by provider-specific multi-turn tool-calling sessions."""
+
+    provider_name: str
+    model_name: str
+
+    async def next_tool_calls(self) -> List[NormalizedToolCall]:
+        """Request the next model turn and return any tool calls requested."""
+
+    def append_tool_results(self, tool_results: List[Tuple[NormalizedToolCall, Dict[str, Any]]]) -> None:
+        """Append tool execution outputs to the provider's conversation history."""
+
+    async def aclose(self) -> None:
+        """Release underlying HTTP client resources."""
+
+
+class GroqProviderSession:
+    """Multi-turn tool-calling session backed by AsyncGroq chat completions."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        tools_schema: List[Dict[str, Any]],
+    ) -> None:
+        from groq import AsyncGroq
+
+        self.provider_name = "groq"
+        self.model_name = model
+        self._tools_schema = tools_schema
+        self._client = AsyncGroq(
+            api_key=api_key,
+            max_retries=settings.llm_max_retries,
+            timeout=settings.llm_timeout_seconds,
+        )
+        self._messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    async def next_tool_calls(self) -> List[NormalizedToolCall]:
+        response = await self._client.chat.completions.create(
+            model=self.model_name,
+            messages=self._messages,
+            tools=self._tools_schema,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            temperature=settings.llm_temperature,
+        )
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return []
+
+        msg = choices[0].message
+        self._messages.append(_serialize_assistant_message(msg))
+        raw_calls = getattr(msg, "tool_calls", None) or []
+        return [
+            NormalizedToolCall(
+                id=tc.id,
+                name=tc.function.name,
+                arguments=tc.function.arguments,
+            )
+            for tc in raw_calls
+        ]
+
+    def append_tool_results(self, tool_results: List[Tuple[NormalizedToolCall, Dict[str, Any]]]) -> None:
+        for tc, result in tool_results:
+            self._messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result),
+            })
+
+    async def aclose(self) -> None:
+        await _close_client_safely(self._client)
+
+
+class GeminiProviderSession:
+    """Multi-turn tool-calling session backed by Google's native google-genai SDK.
+
+    Appends each model candidate's ``Content`` object verbatim to conversation
+    history so Gemini 3+ ``thought_signature`` and ``thought`` parts stay intact
+    across multi-turn tool calls.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        gemini_tools: List[Any],
+    ) -> None:
+        from google import genai
+        from google.genai import types
+
+        self._types = types
+        self.provider_name = "gemini"
+        self.model_name = model
+
+        timeout_ms = max(1, int(round(settings.llm_timeout_seconds * MILLISECONDS_PER_SECOND)))
+        retry_attempts = max(MIN_HTTP_ATTEMPTS, int(settings.llm_max_retries) + 1)
+        http_options = types.HttpOptions(
+            timeout=timeout_ms,
+            retry_options=types.HttpRetryOptions(attempts=retry_attempts),
+        )
+        self._client = genai.Client(api_key=api_key, http_options=http_options)
+        self._config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            tools=gemini_tools,
+            temperature=settings.llm_temperature,
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode=types.FunctionCallingConfigMode.AUTO
+                )
+            ),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+        self._contents: List[Any] = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_prompt)],
+            )
+        ]
+
+    async def next_tool_calls(self) -> List[NormalizedToolCall]:
+        response = await self._client.aio.models.generate_content(
+            model=self.model_name,
+            contents=self._contents,
+            config=self._config,
+        )
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return []
+
+        candidate_content = getattr(candidates[0], "content", None)
+        if candidate_content is None:
+            return []
+
+        # Preserve model Content verbatim (including thought_signature bytes on parts).
+        if getattr(candidate_content, "role", None) is None and hasattr(candidate_content, "model_copy"):
+            candidate_content = candidate_content.model_copy(update={"role": "model"})
+        self._contents.append(candidate_content)
+
+        parts = getattr(candidate_content, "parts", None) or []
+        calls: List[NormalizedToolCall] = []
+        for part in parts:
+            fc = getattr(part, "function_call", None)
+            if fc is None:
+                continue
+            calls.append(
+                NormalizedToolCall(
+                    id=getattr(fc, "id", None),
+                    name=getattr(fc, "name", None) or "",
+                    arguments=getattr(fc, "args", None),
+                )
+            )
+        return calls
+
+    def append_tool_results(self, tool_results: List[Tuple[NormalizedToolCall, Dict[str, Any]]]) -> None:
+        if not tool_results:
+            return
+
+        types = self._types
+        response_parts: List[Any] = []
+        for tc, result in tool_results:
+            response_payload = result if isinstance(result, dict) else {"output": result}
+            if tc.id:
+                part = types.Part(
+                    function_response=types.FunctionResponse(
+                        id=tc.id,
+                        name=tc.name,
+                        response=response_payload,
+                    )
+                )
+            else:
+                part = types.Part.from_function_response(
+                    name=tc.name,
+                    response=response_payload,
+                )
+            response_parts.append(part)
+
+        self._contents.append(types.Content(role="user", parts=response_parts))
+
+    async def aclose(self) -> None:
+        await _close_client_safely(getattr(self._client, "aio", None))
+        await _close_client_safely(self._client)
+
+
+async def _create_llm_session(
+    *,
+    provider: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> LLMProviderSession:
+    """Instantiate the configured LLM provider session with discovered MCP tools."""
+    if not api_key or not api_key.strip():
+        raise ValueError(f"Missing API key for LLM provider '{provider}'.")
+
+    if provider == "gemini":
+        gemini_tools = await discover_mcp_tools_for_gemini()
+        return GeminiProviderSession(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            gemini_tools=gemini_tools,
+        )
+    if provider == "groq":
+        groq_tools = await discover_mcp_tools_for_groq()
+        return GroqProviderSession(
+            api_key=api_key,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            tools_schema=groq_tools,
+        )
+    raise ValueError(f"Unsupported LLM provider '{provider}'.")
+
+
+def _build_triage_prompts(
     alert: AlertPayload,
+    dep_name: str,
     manifest_path: Optional[Path],
-) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution]]:
-    """Execute Groq LLM agentic tool-use loop with openai/gpt-oss-120b and dynamically discovered MCP tools."""
-    from groq import AsyncGroq
-
-    client = AsyncGroq(api_key=settings.groq_api_key)
-    traces: List[MCPToolExecution] = []
-    tools_schema = await discover_mcp_tools_for_groq()
-
-    dep_name = alert.deployment_name or infer_workload_name_from_pod(alert.pod_name)
+    compact_context: Dict[str, Any],
+) -> Tuple[str, str, str]:
+    """Construct shared system/user prompts and target manifest path for any LLM provider."""
     manifest_name = manifest_path.name if manifest_path else f"{dep_name}.yaml"
     target_file = str(manifest_path) if manifest_path else f"{settings.manifests_dir}/{manifest_name}"
 
@@ -387,86 +837,222 @@ async def _run_groq_triage_loop(
 You are connected to a strictly read-only Model Context Protocol (MCP) server.
 Mutating operations (delete, apply, patch, exec) are strictly blocked by 3-layer guardrails.
 
+PRE-HYDRATED DIAGNOSTICS:
+- The 4 baseline read-only MCP checks (`get_pod_status`, `get_pod_events`, `get_pod_logs`, `get_deployment_spec`) have ALREADY been executed for pod '{alert.pod_name}' and workload '{dep_name}' and are provided below.
+- Do NOT re-call those 4 baseline tools for the same pod/workload unless you specifically need a different container's logs, extra log lines, or a different workload.
+
 INSTRUCTIONS:
-1. Inspect the failing pod '{alert.pod_name}' (container: '{alert.container_name or "auto-detect"}') in namespace '{alert.namespace}' using `get_pod_status`, `get_pod_logs`, `get_pod_events`, and `get_deployment_spec` (for workload '{dep_name}').
-2. Diagnose the exact root cause of why the container failed (reason: {alert.reason}, exit_code: {alert.exit_code}) based solely on the actual logs, events, and workload specification returned by the MCP tools.
-3. Once you have gathered evidence from the MCP tools, call `submit_triage_solution` with:
+1. Analyze the pre-hydrated evidence below carefully.
+2. If the evidence clearly identifies the root cause, call `submit_triage_solution` immediately in this turn.
+3. Only if the failure depends on external cluster resources not included below (e.g., ConfigMaps, Services, Endpoints, PVCs, Nodes, or another container/pod), invoke `run_readonly_kubectl` or `get_pod_logs` (you may issue multiple read-only tool calls in parallel) before calling `submit_triage_solution`.
+4. When calling `submit_triage_solution`, supply:
    - root_cause_summary: detailed technical diagnosis citing log/event evidence
    - confidence: float between 0.0 and 1.0
-   - modifications: list of YAML changes targeting '{manifest_name}' (supported parameter_path formats: 'resources.limits.memory', 'resources.requests.memory', 'resources.limits.cpu', 'resources.requests.cpu', 'image', 'command', 'args', or 'env[<ENV_VAR_NAME>]'). Keep memory limits within safe bounds (<= {settings.max_memory_limit}).
-"""
+   - modifications: list of YAML changes targeting '{manifest_name}' (supported parameter_path formats: 'resources.limits.memory', 'resources.requests.memory', 'resources.limits.cpu', 'resources.requests.cpu', 'image', 'command', 'args', 'replicas', or 'env[<ENV_VAR_NAME>]'). Keep memory limits within safe bounds (<= {settings.max_memory_limit} unless existing workload limit is already higher)."""
 
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                f"Incident alert: Pod '{alert.pod_name}' in namespace '{alert.namespace}' (Workload: '{dep_name}', "
-                f"Container: '{alert.container_name or 'primary'}') is failing with reason '{alert.reason}' "
-                f"(exit_code={alert.exit_code}). Diagnostic message: {alert.message or 'N/A'}. "
-                "Investigate via MCP tools and submit a remediation patch."
-            ),
-        },
-    ]
+    user_prompt = (
+        f"Incident alert: Pod '{alert.pod_name}' in namespace '{alert.namespace}' (Workload: '{dep_name}', "
+        f"Container: '{alert.container_name or 'auto-detect'}') failed with reason '{alert.reason}' "
+        f"(exit_code={alert.exit_code}). Diagnostic message: {alert.message or 'N/A'}.\n\n"
+        f"Pre-hydrated MCP Telemetry:\n{json.dumps(compact_context, indent=2)}"
+    )
+    return system_prompt, user_prompt, target_file
 
-    max_turns = 6
-    for _ in range(max_turns):
-        response = await client.chat.completions.create(
-            model=settings.groq_model,
-            messages=messages,
-            tools=tools_schema,
-            tool_choice="auto",
-            temperature=0.1,
+
+async def _execute_llm_tool_turn(
+    tool_calls: List[NormalizedToolCall],
+    traces: List[MCPToolExecution],
+) -> Tuple[List[Tuple[NormalizedToolCall, Dict[str, Any]]], Optional[Dict[str, Any]]]:
+    """Validate and execute all tool calls emitted in a single LLM turn."""
+    tool_results: List[Tuple[NormalizedToolCall, Dict[str, Any]]] = []
+    solution_found: Optional[Dict[str, Any]] = None
+
+    for tc in tool_calls:
+        parsed_args, parse_err = _parse_tool_arguments(tc.arguments)
+        if parse_err is not None or parsed_args is None:
+            tool_results.append((tc, {"status": "error", "error": parse_err}))
+            continue
+
+        if tc.name == "submit_triage_solution":
+            solution_found = parsed_args
+            tool_results.append((tc, {"status": "accepted"}))
+            continue
+
+        result, trace = await execute_mcp_tool_call(tc.name, parsed_args)
+        traces.append(trace)
+        tool_results.append((tc, result))
+
+    return tool_results, solution_found
+
+
+def _build_llm_triage_result(
+    solution: Dict[str, Any],
+    alert: AlertPayload,
+    target_file: str,
+    traces: List[MCPToolExecution],
+) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution]]:
+    """Convert a validated submit_triage_solution payload into structured triage outputs."""
+    root_cause = str(solution.get("root_cause_summary") or "Diagnosed by LLM agent.")
+    try:
+        confidence = max(0.0, min(1.0, float(solution.get("confidence", 0.95))))
+    except (TypeError, ValueError):
+        confidence = 0.9
+
+    raw_mods = solution.get("modifications") or []
+    modifications: List[YAMLModification] = []
+    for rm in raw_mods:
+        if not isinstance(rm, dict):
+            continue
+        modifications.append(
+            YAMLModification(
+                file_path=target_file,
+                container_name=rm.get("container_name") or alert.container_name,
+                parameter_path=str(rm.get("parameter_path", "")),
+                old_value=rm.get("old_value"),
+                new_value=rm.get("new_value"),
+                rationale=str(rm.get("rationale", "")),
+            )
         )
+    return root_cause, confidence, modifications, traces
 
-        choice = response.choices[0]
-        msg = choice.message
-        messages.append(msg.model_dump(exclude_none=True))
 
-        if not msg.tool_calls:
-            break
+async def _run_llm_triage_loop_with_metadata(
+    alert: AlertPayload,
+    manifest_path: Optional[Path],
+    baseline_context: Optional[Dict[str, Any]] = None,
+    baseline_traces: Optional[List[MCPToolExecution]] = None,
+    provider_override: Optional[str] = None,
+) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution], str, Optional[str]]:
+    """Pre-hydrate MCP telemetry, then run paced multi-turn LLM reasoning using the active provider."""
+    dep_name = alert.deployment_name or infer_workload_name_from_pod(alert.pod_name)
+    if baseline_context is None or baseline_traces is None:
+        baseline_context, gathered_traces = await gather_baseline_mcp_telemetry(alert, dep_name)
+        traces: List[MCPToolExecution] = list(gathered_traces)
+    else:
+        traces = list(baseline_traces)
 
-        solution_found = None
-        for tc in msg.tool_calls:
-            tool_name = tc.function.name
-            args = json.loads(tc.function.arguments or "{}")
+    llm_cfg = settings.resolve_llm_config(provider_override=provider_override)
+    if not llm_cfg.is_configured or not llm_cfg.api_key:
+        root_cause, confidence, mods, fallback_traces = await _deterministic_fallback_triage(
+            alert,
+            manifest_path,
+            baseline_context=baseline_context,
+            baseline_traces=traces,
+        )
+        return root_cause, confidence, mods, fallback_traces, DETERMINISTIC_ENGINE_NAME, None
 
-            if tool_name == "submit_triage_solution":
-                solution_found = args
-                break
+    compact_context = compact_telemetry_for_llm(
+        baseline_context,
+        max_log_chars=settings.llm_max_log_chars,
+    )
+    system_prompt, user_prompt, target_file = _build_triage_prompts(
+        alert,
+        dep_name,
+        manifest_path,
+        compact_context,
+    )
 
-            result, trace = await execute_mcp_tool_call(tool_name, args)
-            traces.append(trace)
+    session = await _create_llm_session(
+        provider=llm_cfg.provider,
+        api_key=llm_cfg.api_key,
+        model=llm_cfg.model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    semaphore = _get_llm_semaphore()
+    max_turns = max(1, int(settings.llm_max_turns))
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": json.dumps(result),
-            })
+    try:
+        async with semaphore:
+            try:
+                for turn_idx in range(max_turns):
+                    tool_calls = await session.next_tool_calls()
+                    if not tool_calls:
+                        break
 
-        if solution_found:
-            root_cause = solution_found.get("root_cause_summary", "Diagnosed by Groq agent.")
-            confidence = float(solution_found.get("confidence", 0.95))
-            raw_mods = solution_found.get("modifications", [])
-            modifications = []
-            for rm in raw_mods:
-                modifications.append(
-                    YAMLModification(
-                        file_path=target_file,
-                        container_name=rm.get("container_name") or alert.container_name,
-                        parameter_path=rm.get("parameter_path", ""),
-                        old_value=rm.get("old_value"),
-                        new_value=rm.get("new_value"),
-                        rationale=rm.get("rationale", ""),
-                    )
-                )
-            return root_cause, confidence, modifications, traces
+                    tool_results, solution_found = await _execute_llm_tool_turn(tool_calls, traces)
+                    session.append_tool_results(tool_results)
 
-    return await _deterministic_fallback_triage(alert, manifest_path)
+                    if solution_found is not None:
+                        logger.info(
+                            "%s triage (%s) completed for pod '%s' in %d LLM turn(s) (%d MCP trace(s)).",
+                            llm_cfg.provider.capitalize(),
+                            llm_cfg.model,
+                            alert.pod_name,
+                            turn_idx + 1,
+                            len(traces),
+                        )
+                        root_cause, confidence, mods, final_traces = _build_llm_triage_result(
+                            solution_found, alert, target_file, traces
+                        )
+                        return root_cause, confidence, mods, final_traces, llm_cfg.provider, llm_cfg.model
+            finally:
+                if settings.llm_inter_request_delay_seconds > 0:
+                    await asyncio.sleep(settings.llm_inter_request_delay_seconds)
+    finally:
+        await session.aclose()
+
+    root_cause, confidence, mods, fallback_traces = await _deterministic_fallback_triage(
+        alert,
+        manifest_path,
+        baseline_context=baseline_context,
+        baseline_traces=traces,
+    )
+    return root_cause, confidence, mods, fallback_traces, DETERMINISTIC_ENGINE_NAME, None
+
+
+async def _run_llm_triage_loop(
+    alert: AlertPayload,
+    manifest_path: Optional[Path],
+    baseline_context: Optional[Dict[str, Any]] = None,
+    baseline_traces: Optional[List[MCPToolExecution]] = None,
+    provider_override: Optional[str] = None,
+) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution]]:
+    """Run paced LLM reasoning and return the 4-tuple triage output."""
+    root_cause, confidence, mods, traces, _, _ = await _run_llm_triage_loop_with_metadata(
+        alert,
+        manifest_path,
+        baseline_context=baseline_context,
+        baseline_traces=baseline_traces,
+        provider_override=provider_override,
+    )
+    return root_cause, confidence, mods, traces
+
+
+async def _run_groq_triage_loop(
+    alert: AlertPayload,
+    manifest_path: Optional[Path],
+    baseline_context: Optional[Dict[str, Any]] = None,
+    baseline_traces: Optional[List[MCPToolExecution]] = None,
+) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution]]:
+    """Run paced LLM reasoning explicitly using Groq."""
+    return await _run_llm_triage_loop(
+        alert,
+        manifest_path,
+        baseline_context=baseline_context,
+        baseline_traces=baseline_traces,
+        provider_override="groq",
+    )
+
+
+async def _run_gemini_triage_loop(
+    alert: AlertPayload,
+    manifest_path: Optional[Path],
+    baseline_context: Optional[Dict[str, Any]] = None,
+    baseline_traces: Optional[List[MCPToolExecution]] = None,
+) -> Tuple[str, float, List[YAMLModification], List[MCPToolExecution]]:
+    """Run paced LLM reasoning explicitly using Google Gemini."""
+    return await _run_llm_triage_loop(
+        alert,
+        manifest_path,
+        baseline_context=baseline_context,
+        baseline_traces=baseline_traces,
+        provider_override="gemini",
+    )
 
 
 async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
-    """End-to-end triage orchestrator: LLM reasoning -> MCP inspections -> YAML patching -> PR proposal."""
+    """End-to-end triage orchestrator: MCP pre-hydration -> LLM reasoning -> YAML patching -> PR proposal."""
     start_time = time.time()
     incident_id = str(uuid.uuid4())[:8]
 
@@ -476,15 +1062,43 @@ async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
         alert.deployment_name = dep_name
 
     manifest_path = find_manifest_for_deployment(settings.manifests_dir, dep_name)
+    baseline_context, baseline_traces = await gather_baseline_mcp_telemetry(alert, dep_name)
 
-    if settings.groq_api_key and settings.groq_api_key.strip():
-        try:
-            root_cause, confidence, modifications, mcp_traces = await _run_groq_triage_loop(alert, manifest_path)
-        except Exception as e:
-            logger.warning(f"Groq API call failed ({e}); falling back to deterministic triage.")
-            root_cause, confidence, modifications, mcp_traces = await _deterministic_fallback_triage(alert, manifest_path)
+    triage_result: Optional[
+        Tuple[str, float, List[YAMLModification], List[MCPToolExecution], str, Optional[str]]
+    ] = None
+    try:
+        llm_cfg = settings.resolve_llm_config()
+        if llm_cfg.is_configured:
+            try:
+                triage_result = await _run_llm_triage_loop_with_metadata(
+                    alert,
+                    manifest_path,
+                    baseline_context=baseline_context,
+                    baseline_traces=baseline_traces,
+                )
+            except Exception as e:
+                logger.warning(f"{llm_cfg.provider.capitalize()} API call failed ({e}); falling back to deterministic triage.")
+    except ValueError as e:
+        logger.warning(f"Invalid LLM configuration ({e}); falling back to deterministic triage.")
+
+    if triage_result is None:
+        root_cause, confidence, modifications, mcp_traces = await _deterministic_fallback_triage(
+            alert,
+            manifest_path,
+            baseline_context=baseline_context,
+            baseline_traces=baseline_traces,
+        )
+        engine_provider = DETERMINISTIC_ENGINE_NAME
+        engine_model: Optional[str] = None
     else:
-        root_cause, confidence, modifications, mcp_traces = await _deterministic_fallback_triage(alert, manifest_path)
+        root_cause, confidence, modifications, mcp_traces, engine_provider, engine_model = triage_result
+
+    engine_label = settings.format_llm_attribution(
+        provider=engine_provider,
+        model=engine_model,
+        is_configured=(engine_provider != DETERMINISTIC_ENGINE_NAME),
+    )
 
     diff_content = ""
     pr_url = None
@@ -509,6 +1123,7 @@ async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
                 patched_content=patched_yaml,
                 diff_content=diff_content,
                 mcp_traces=mcp_traces,
+                engine_label=engine_label,
             )
         except Exception as e:
             logger.error(f"Failed to generate YAML patch or PR proposal: {e}")
@@ -529,5 +1144,7 @@ async def run_triage_pipeline(alert: AlertPayload) -> TriageReport:
         yaml_diff=diff_content,
         pr_url=pr_url,
         local_proposal_path=local_proposal_path,
+        llm_provider=engine_provider,
+        llm_model=engine_model,
         duration_seconds=duration,
     )

@@ -48,5 +48,7 @@ class TriageReport(BaseModel):
     yaml_diff: Optional[str] = None
     pr_url: Optional[str] = None
     local_proposal_path: Optional[str] = None
+    llm_provider: Optional[str] = Field(default=None, description="Engine that diagnosed the incident ('gemini', 'groq', or 'deterministic')")
+    llm_model: Optional[str] = Field(default=None, description="Model identifier used when an LLM diagnosed the incident")
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     duration_seconds: Optional[float] = None

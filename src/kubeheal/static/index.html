@@ -623,7 +623,7 @@
     <section class="triage-inspector" id="triageInspector">
       <div class="empty-inspector">
         <h2>Ready for incident triage</h2>
-        <p>Select an active crash scenario above to dispatch the Groq triage agent across the read-only MCP tool suite and generate a GitOps YAML remediation patch.</p>
+        <p>Select an active crash scenario above to dispatch the KubeHeal triage agent across the read-only MCP tool suite and generate a GitOps YAML remediation patch.</p>
       </div>
     </section>
   </main>
@@ -633,8 +633,31 @@
   <script>
     let incidents = [];
     let activeIncidentId = null;
-    let currentGroqModel = "openai/gpt-oss-120b";
+    let currentLlmLabel = "Gemini: gemini-3.5-flash-lite";
     let currentMaxMemoryCap = "1Gi";
+
+    const PROVIDER_DISPLAY_MAP = {
+      gemini: "Gemini",
+      groq: "Groq",
+      deterministic: "Deterministic Fallback"
+    };
+
+    function formatProviderName(provider) {
+      if (!provider) return "AI";
+      const key = String(provider).toLowerCase();
+      return PROVIDER_DISPLAY_MAP[key] || (key.charAt(0).toUpperCase() + key.slice(1));
+    }
+
+    function formatIncidentEngineLabel(inc) {
+      if (inc && inc.llm_provider) {
+        if (inc.llm_provider === "deterministic") {
+          return "Deterministic Diagnostic Engine";
+        }
+        const label = formatProviderName(inc.llm_provider);
+        return inc.llm_model ? `${label}: ${inc.llm_model}` : label;
+      }
+      return currentLlmLabel;
+    }
 
     function notify(message, isError = false) {
       const el = document.getElementById("statusToast");
@@ -648,15 +671,21 @@
       try {
         const res = await fetch("/api/health");
         const h = await res.json();
-        if (h.groq_model) currentGroqModel = h.groq_model;
+        const provider = h.llm_provider || (h.groq_model ? "groq" : "gemini");
+        const model = h.llm_model || h.groq_model || "gemini-3.5-flash-lite";
+        const providerLabel = formatProviderName(provider);
+        const isConfigured = h.llm_configured !== undefined ? Boolean(h.llm_configured) : Boolean(h.groq_configured);
+        currentLlmLabel = isConfigured
+          ? `${providerLabel}: ${model}`
+          : `Deterministic Fallback (${providerLabel} unconfigured)`;
         if (h.guardrails && h.guardrails.max_memory_cap) currentMaxMemoryCap = h.guardrails.max_memory_cap;
         const container = document.getElementById("telemetryPills");
         container.innerHTML = `
           <span class="pill pill-jade">
             <span class="status-dot"></span>MCP Read-Only Active (${h.mcp_tool_count || 5} tools)
           </span>
-          <span class="pill pill-cyan">
-            <span class="status-dot"></span>Groq: ${escapeHtml(h.groq_model)}
+          <span class="pill ${isConfigured ? 'pill-cyan' : ''}">
+            <span class="status-dot"></span>${escapeHtml(currentLlmLabel)}
           </span>
           <span class="pill ${h.cluster_connected ? 'pill-jade' : ''}">
             <span class="status-dot"></span>${h.cluster_connected ? 'k3d Cluster Live' : 'Manifest Simulation Mode'}
@@ -793,7 +822,7 @@
         <div class="panel-card">
           <div class="panel-heading">
             <span>Root Cause Diagnosis</span>
-            <span style="font-family:var(--font-mono); font-size:12px; color:var(--ink-muted);">Model: ${escapeHtml(currentGroqModel)}</span>
+            <span style="font-family:var(--font-mono); font-size:12px; color:var(--ink-muted);">Engine: ${escapeHtml(formatIncidentEngineLabel(inc))}</span>
           </div>
           <div class="diagnosis-prose">${escapeHtml(inc.root_cause_summary)}</div>
         </div>

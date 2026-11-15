@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from kubeheal.agent.triage_agent import execute_mcp_tool_call, run_triage_pipeline
-from kubeheal.config import settings
+from kubeheal.config import LLMProviderConfig, settings
 from kubeheal.mcp_server.guardrails import validate_kubectl_command
 from kubeheal.mcp_server.server import mcp
 from kubeheal.models import AlertPayload, MCPToolExecution, TriageReport
@@ -88,11 +88,30 @@ async def health_check():
             "run_readonly_kubectl",
         ]
 
+    try:
+        llm_cfg = settings.resolve_llm_config()
+    except ValueError:
+        llm_cfg = LLMProviderConfig(
+            provider=str(settings.llm_provider),
+            model="",
+            api_key=None,
+            is_configured=False,
+        )
+
+    gemini_configured = bool(settings.gemini_api_key and settings.gemini_api_key.strip())
+    groq_configured = bool(settings.groq_api_key and settings.groq_api_key.strip())
+
     return {
         "status": "healthy",
         "cluster_connected": core_v1 is not None,
         "k8s_watcher_enabled": settings.enable_k8s_watcher,
-        "groq_configured": bool(settings.groq_api_key and settings.groq_api_key.strip()),
+        "llm_provider": llm_cfg.provider,
+        "llm_model": llm_cfg.model,
+        "llm_configured": llm_cfg.is_configured,
+        "llm_mode": "ai" if llm_cfg.is_configured else "deterministic_fallback",
+        "gemini_configured": gemini_configured,
+        "gemini_model": settings.gemini_model,
+        "groq_configured": groq_configured,
         "groq_model": settings.groq_model,
         "dry_run_mode": settings.dry_run_mode,
         "github_configured": bool(settings.github_token and settings.github_repo),

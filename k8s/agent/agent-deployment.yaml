@@ -30,6 +30,16 @@ spec:
               value: "10"
             - name: ALERT_COOLDOWN_SECONDS
               value: "180"
+            - name: LLM_PROVIDER
+              value: "auto"
+            - name: GEMINI_MODEL
+              value: "gemini-3.5-flash-lite"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kubeheal-secrets
+                  key: gemini-api-key
+                  optional: true
             - name: GROQ_API_KEY
               valueFrom:
                 secretKeyRef:
